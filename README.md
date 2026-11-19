@@ -6,6 +6,14 @@
 
 ---
 
+<p align="center">
+  <img src="docs/assets/6dof-welding-kinematics.png" alt="6-DoF Industrial Welding Manipulator with Spherical Wrist" width="820" />
+</p>
+
+> 📖 Подробное описание математических моделей ($SE(3)/SO(3)$, аналитический якобиан, метод Левенберга — Марквардта) и CUDA-ускорения доступно в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+---
+
 ## Ключевой принцип
 
 **LLM не является источником истины для безопасности и корректности робототехнической программы.**
@@ -117,6 +125,14 @@ python3 -m mcp_robot_welding.mcp_server
 ```
 
 ---
+
+## ⚡ GPU / CUDA Spatial Indexing Benchmark (`notebooks/cuda_morton_broadphase_benchmark.ipynb`)
+
+Для ускорения проверки коллизий сложной CAD-геометрии (Broad-Phase Collision Detection) реализовано CUDA-ядро расчёта 30-битных кодов Мортона (Z-order кривой) с раскладкой данных **Structure of Arrays (SoA)** для коалесцированного доступа к памяти GPU и вызовом из Python через `ctypes`:
+
+* **Объём сцены:** `1 000 000` 3D-примитивов
+* **CPU (NumPy):** `37.23 ms`
+* **GPU (NVIDIA T4 CUDA Kernel):** `0.201 ms` (**185.2x ускорение**, побитовая верификация `100%`)
 
 ## Направления дальнейшего развития
 
