@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from mcp_robot_welding.kinematics import SixDofArm, create_manipulator
+from mcp_robot_welding.kinematics import SixDofArm
 from mcp_robot_welding.mcp_server import (
     export_robot_program,
     inspect_workpiece,
@@ -24,8 +24,10 @@ def _make_waypoint(
         move_type=move_type,
         xyz_mm=np.array([500.0, 0.0, 200.0], dtype=np.float64),
         joints_deg=np.zeros(dof, dtype=np.float64),
+        orientation=np.eye(3, dtype=np.float64),
         arc_state=arc_state,
-        speed_mm_s=30.0,
+        tcp_speed_mm_s=30.0 if move_type == "MOVL" else None,
+        joint_speed_percent=40.0 if move_type == "MOVJ" else None,
     )
 
 
@@ -59,8 +61,9 @@ def test_compile_gcode_program() -> None:
     )
     assert "G21" in program
     assert "G90" in program
-    assert "M03 S100" in program
-    assert "M05" in program
+    assert "G94" in program
+    assert "M62 P1" in program
+    assert "M64 P1" in program
     assert "M30" in program
 
 
@@ -119,11 +122,12 @@ def test_full_mcp_welding_pipeline() -> None:
 
     assert "' PROGRAM: BRACKET_WELD_01" in program_code
     assert "' ROBOT MODEL: industrial_6dof" in program_code
-    assert "SERVO ON" in program_code
-    assert "HOPEN 1" in program_code
-    assert "HCLOSE 1" in program_code
-    assert "MOVL" in program_code
-    assert "END" in program_code
+    assert "Servo On" in program_code
+    assert "ArcStart 1" in program_code
+    assert "ArcEnd 1" in program_code
+    assert "Mov P1" in program_code
+    assert "Mvs " in program_code
+    assert "End" in program_code
 
     # 4. Safety check: unknown seam is rejected before motion generation
     invalid_planning_result = plan_and_simulate_weld(

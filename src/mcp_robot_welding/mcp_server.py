@@ -25,6 +25,8 @@ WELD_PATH_COLLISION_SAMPLES = 20
 MOVJ_COLLISION_SAMPLES = 15
 MAX_WELD_SPEED_MM_S = 250.0
 MAX_APPROACH_CLEARANCE_MM = 300.0
+DEFAULT_TRANSIT_JOINT_SPEED_PERCENT = 50.0
+DEFAULT_APPROACH_JOINT_SPEED_PERCENT = 40.0
 PROGRAM_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -188,7 +190,8 @@ def plan_and_simulate_weld(
                 move_type="MOVJ",
                 xyz_mm=home_xyz,
                 joints_deg=np.rad2deg(q_home),
-                speed_mm_s=150.0,
+                orientation=home_tool_orientation,
+                joint_speed_percent=DEFAULT_TRANSIT_JOINT_SPEED_PERCENT,
             )
         )
         q_current = q_home.copy()
@@ -222,11 +225,12 @@ def plan_and_simulate_weld(
                         move_type="MOVJ",
                         xyz_mm=home_xyz,
                         joints_deg=np.rad2deg(q_home),
-                        speed_mm_s=150.0,
+                        orientation=home_tool_orientation,
+                        joint_speed_percent=DEFAULT_TRANSIT_JOINT_SPEED_PERCENT,
                     )
                 )
                 q_current = q_home.copy()
-            
+
             seam = scene.seams[seam_id]
             seam_start = np.asarray(seam.start_xyz, dtype=np.float64)
             seam_end = np.asarray(seam.end_xyz, dtype=np.float64)
@@ -267,9 +271,9 @@ def plan_and_simulate_weld(
                     "target_xyz": approach_xyz.tolist(),
                     "target_tool_z": target_tool_z.tolist(),
                     "position_error_mm": round(err_app, 3),
-                    "exceeded_coarse_reach": bool(np.linalg.norm(approach_xyz) > arm.max_reach_mm),
-                    "partial_plan_retained": False,
-                }
+                                    "exceeded_coarse_reach": bool(np.linalg.norm(approach_xyz) > arm.max_reach_mm),
+                "partial_plan_retained": False,
+            }
 
             if arm.joint_jump(q_approach, q_current) > MAX_WAYPOINT_JOINT_JUMP_DEGREES:
                 return {
@@ -296,7 +300,8 @@ def plan_and_simulate_weld(
                     move_type="MOVJ",
                     xyz_mm=approach_xyz,
                     joints_deg=np.rad2deg(q_approach),
-                                        speed_mm_s=120.0,
+                    orientation=tool_orientation,
+                    joint_speed_percent=DEFAULT_APPROACH_JOINT_SPEED_PERCENT,
                 )
             )
             q_current = q_approach.copy()
@@ -339,8 +344,9 @@ def plan_and_simulate_weld(
                     move_type="MOVL",
                     xyz_mm=seam_start,
                     joints_deg=np.rad2deg(q_start),
+                    orientation=tool_orientation,
                     arc_state="ARC_ON",
-                    speed_mm_s=weld_speed_mm_s,
+                    tcp_speed_mm_s=weld_speed_mm_s,
                 )
             )
             q_current = q_start.copy()
@@ -413,7 +419,8 @@ def plan_and_simulate_weld(
                     move_type="MOVL",
                     xyz_mm=mid_xyz,
                     joints_deg=np.rad2deg(q_mid),
-                    speed_mm_s=weld_speed_mm_s,
+                    orientation=tool_orientation,
+                    tcp_speed_mm_s=weld_speed_mm_s,
                 )
             )
             planned_waypoints.append(
@@ -422,8 +429,9 @@ def plan_and_simulate_weld(
                     move_type="MOVL",
                     xyz_mm=seam_end,
                     joints_deg=np.rad2deg(q_end),
+                    orientation=tool_orientation,
                     arc_state="ARC_OFF",
-                    speed_mm_s=weld_speed_mm_s,
+                    tcp_speed_mm_s=weld_speed_mm_s,
                 )
             )
             q_current = q_end.copy()
@@ -464,7 +472,8 @@ def plan_and_simulate_weld(
                     move_type="MOVJ",
                     xyz_mm=retract_xyz,
                     joints_deg=np.rad2deg(q_retract),
-                    speed_mm_s=120.0,
+                    orientation=tool_orientation,
+                    joint_speed_percent=DEFAULT_APPROACH_JOINT_SPEED_PERCENT,
                 )
             )
             q_current = q_retract.copy()
@@ -503,7 +512,8 @@ def plan_and_simulate_weld(
                 move_type="MOVJ",
                 xyz_mm=home_xyz,
                 joints_deg=np.rad2deg(q_ret_home),
-                speed_mm_s=150.0,
+                orientation=home_tool_orientation,
+                joint_speed_percent=DEFAULT_TRANSIT_JOINT_SPEED_PERCENT,
             )
         )
 
@@ -511,7 +521,7 @@ def plan_and_simulate_weld(
         record = ValidatedPlanRecord(
             plan_id=plan_id,
             robot_type=arm.robot_type,
-            dof=arm.dof,
+                        dof=arm.dof,
             seams_planned=list(seam_ids),
             waypoints=tuple(planned_waypoints),
         )
@@ -615,3 +625,5 @@ def export_robot_program(
 
 if __name__ == "__main__":
     mcp.run()
+
+
