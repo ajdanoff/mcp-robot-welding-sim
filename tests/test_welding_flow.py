@@ -97,7 +97,7 @@ def test_full_mcp_welding_pipeline() -> None:
     )
     assert planning_result["collision_free"] is True
     assert planning_result["seams_planned"] == ["seam_top_rib", "seam_left_flange"]
-    assert planning_result["total_waypoints"] == 12
+    assert planning_result["total_waypoints"] == 13
 
     waypoint_labels = [
         wp["label"] for wp in planning_result["waypoints_summary"]
@@ -106,6 +106,7 @@ def test_full_mcp_welding_pipeline() -> None:
     assert waypoint_labels[-1] == "RETURN_HOME"
     assert "seam_top_rib_START" in waypoint_labels
     assert "seam_left_flange_END" in waypoint_labels
+    assert "seam_left_flange_SAFE_TRANSIT" in waypoint_labels
 
     # 3. Postprocessor compiles MELFA-BASIC robot program
     compilation_result = export_robot_program(

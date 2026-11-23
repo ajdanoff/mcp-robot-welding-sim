@@ -369,6 +369,11 @@ class RobotManipulator:
                 jump_deg = float(np.rad2deg(diff))
             max_jump_deg = max(max_jump_deg, jump_deg)
         return max_jump_deg
+    
+    def joint_jump(self, q_new: np.ndarray, q_old: np.ndarray) -> float:
+        """Public wrapper returning max joint-space jump in equivalent degrees."""
+        return self._normalized_joint_jump(q_new, q_old)
+
 
 
 SUPPORTED_ROBOTS: dict[str, str] = {
