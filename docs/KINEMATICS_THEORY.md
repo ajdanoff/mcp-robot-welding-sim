@@ -11,23 +11,33 @@
   * *Вращательный сустав (Revolute, R):* обобщённая координата — угол поворота $q_i = \theta_i \in \mathbb{R}$.
   * *Поступательный сустав (Prismatic, P):* обобщённая координата — линейное смещение $q_i = d_i \in \mathbb{R}$.
 * **Пространство обобщённых координат (Joint Space, $\mathcal{Q}$):** вектор конфигураций всех $n$ суставов робота:
-  $$q = [q_1, q_2, \dots, q_n]^T \in \mathbb{R}^n$$
+
+```math
+q \(= \begin{bmatrix} q_1 & q_2 & \dots & q_n \end{bmatrix}^T \in \mathbb{R}^n \%\%\)MAGIT_PARSER_PROTECT%%```
+
 * **Рабочее пространство (Task / Operational Space, $SE(3)$):** пространство положений и ориентаций рабочего инструмента (**TCP — Tool Center Point**) в декартовой системе координат базы робота. Поза инструмента задаётся матрицей однородного преобразования размерности $4 \times 4$:
-  $$T = \begin{bmatrix} R & p \\ 0^T & 1 \end{bmatrix} \in SE(3), \quad R \in SO(3), \; p \in \mathbb{R}^3$$
-  где $R$ — ортогональная матрица поворота ($\det R = +1$, $R^T R = I$), а $p = [x, y, z]^T$ — вектор координат кончика сварочной горелки.
+
+```math
+T \(= \begin{bmatrix} R & p \\ 0^T & 1 \end{bmatrix} \in SE(3), \quad R \in SO(3), \quad p = \begin{bmatrix} x \\ y \\ z \end{bmatrix} \in \mathbb{R}^3 \%\%\)MAGIT_PARSER_PROTECT%%```
+
+где $R$ — ортогональная матрица поворота ($\det R = +1$, $R^T R = I$), а $p$ — вектор координат кончика сварочной горелки.
 
 ---
 
 ## 2. Прямая задача кинематики (Forward Kinematics, FK)
 
 **Определение:** по заданному вектору углов/смещений в суставах $q$ вычислить положение и ориентацию инструмента $T_{\text{tcp}}(q)$ в базовой системе координат:
-$$f: \mathcal{Q} \to SE(3), \quad T_{\text{tcp}}(q) = T_0^1(q_1) \cdot T_1^2(q_2) \cdots T_{n-1}^n(q_n)$$
+
+```math
+f: \(\mathcal{Q} \to SE(3), \quad T_{\text{tcp}}(q) = T_0^1(q_1) \cdot T_1^2(q_2) \cdots\) T_{n-1}^n(q_n)
+```
 
 ### Параметризация Денавита — Хартенберга (DH)
 
 Переход между соседними системами координат $i-1$ и $i$ описывается четырьмя параметрами $(a_i, \alpha_i, d_i, \theta_i)$ и раскладывается на 4 элементарных преобразования:
 
-$$T_{i-1}^i(\theta_i) = \text{Rot}_z(\theta_i)\,\text{Trans}_z(d_i)\,\text{Trans}_x(a_i)\,\text{Rot}_x(\alpha_i) = \begin{bmatrix} \cos\theta_i & -\sin\theta_i\cos\alpha_i & \sin\theta_i\sin\alpha_i & a_i\cos\theta_i \\ \sin\theta_i & \cos\theta_i\cos\alpha_i & -\cos\theta_i\sin\alpha_i & a_i\sin\theta_i \\ 0 & \sin\alpha_i & \cos\alpha_i & d_i \\ 0 & 0 & 0 & 1 \end{bmatrix}$$
+```math
+T_{i-1}\(^i(\theta_i) = \text{Rot}_z(\theta_i)\,\text{Trans}_z(d_i)\,\text{Trans}_x(a_i)\,\text{Rot}_x(\alpha_i) = \begin{bmatrix} \cos\theta_i & -\sin\theta_i\cos\alpha_i & \sin\theta_i\sin\alpha_i & a_i\cos\theta_i \\ \sin\theta_i & \cos\theta_i\cos\alpha_i & -\cos\theta_i\sin\alpha_i & a_i\sin\theta_i \\ 0 & \sin\alpha_i & \cos\alpha_i & d_i \\ 0 & 0 & 0 & 1 \end{bmatrix} \%\%\)MAGIT_PARSER_PROTECT%%```
 
 * **Свойства прямой задачи:**
   * Решается **аналитически и однозначно** за $O(n)$ матричных умножений.
@@ -38,7 +48,9 @@ $$T_{i-1}^i(\theta_i) = \text{Rot}_z(\theta_i)\,\text{Trans}_z(d_i)\,\text{Trans
 ## 3. Обратная задача кинематики (Inverse Kinematics, IK)
 
 **Определение:** по заданной целевой позе инструмента $T_{\text{target}} = (R_{\text{target}}, p_{\text{target}}) \in SE(3)$ найти вектор обобщённых координат $q^*$, при котором инструмент попадает в целевую точку с требуемой ориентацией:
-$$f(q^*) = T_{\text{target}}$$
+
+```math
+f\((q^*) = T_{\text{target}} \%\%\)MAGIT_PARSER_PROTECT%%```
 
 ### Почему обратная задача сложнее прямой
 
@@ -52,13 +64,17 @@ $$f(q^*) = T_{\text{target}}$$
 
 Для численного решения IK нелинейная задача линеаризуется в окрестности текущей конфигурации $q$ с помощью **матрицы Якоби (якобиана)** $J(q) \in \mathbb{R}^{6 \times n}$, связывающей скорости в суставах $\dot{q}$ с линейной ($v$) и угловой ($\omega$) скоростями инструмента:
 
-$$\begin{bmatrix} v \\ \omega \end{bmatrix} = J(q)\,\dot{q}, \qquad \Delta X \approx J(q)\,\Delta q$$
+```math
+\(\begin{bmatrix} v \\ \omega \end{bmatrix} = J(q)\,\dot{q}, \qquad \Delta X \approx J(q)\,\Delta\) q
+```
 
 ### Аналитическое построение столбцов якобиана (`compute_jacobian`)
 
 Для каждого вращательного сустава $i$ столбец $J_i \in \mathbb{R}^6$ вычисляется напрямую из уже найденных при прямом проходе матриц $T_0^i$:
-* **Линейная часть:** $J_{v,i} = z_i \times (p_{\text{tcp}} - p_i)$
-* **Угловая часть:** $J_{\omega,i} = z_i$
+
+```math
+J_{v,i} = z_i \(\times (p_{\text{tcp}} - p_i), \qquad J_\){\(\omega,\)i} = z_i
+```
 
 где $z_i$ — единичный вектор оси вращения $i$-го сустава, $p_i$ — начало координат $i$-го сустава, $p_{\text{tcp}}$ — координаты кончика инструмента (всё в базовой системе координат).
 
@@ -66,20 +82,32 @@ $$\begin{bmatrix} v \\ \omega \end{bmatrix} = J(q)\,\dot{q}, \qquad \Delta X \ap
 
 ## 5. Вектор ошибки на $SE(3)$ и метод Левенберга — Марквардта
 
-На каждой итерации вычисляется 6-мерный вектор невязки $e = [e_{\text{pos}}^T, \; e_{\text{rot}}^T]^T \in \mathbb{R}^6$:
+На каждой итерации вычисляется 6-мерный вектор невязки $e$:
+
+```math
+e \(= \begin{bmatrix} e_{\text{pos}} \\ e_{\text{rot}} \end{bmatrix} \in \mathbb{R}^6 \%\%\)MAGIT_PARSER_PROTECT%%```
 
 1. **Ошибка позиции ($\mathbb{R}^3$):**
-   $$e_{\text{pos}} = p_{\text{target}} - p_{\text{cur}}(q)$$
+
+```math
+\(e_{\text{pos}} = p_{\text{target}} - p_{\text{cur}}\)(q)
+```
 
 2. **Ошибка ориентации (логарифмическое отображение $SO(3) \to \mathfrak{so}(3)$):**
    Матрица относительного поворота $R_{\text{err}} = R_{\text{target}} R_{\text{cur}}^T$ переводится в вектор конечного поворота (ось $\hat{u}$, умноженная на угол $\phi$):
-   $$\phi = \arccos\left(\frac{\operatorname{tr}(R_{\text{err}}) - 1}{2}\right), \qquad e_{\text{rot}} = \frac{\phi}{2\sin\phi} \begin{bmatrix} R_{\text{err}}[2,1] - R_{\text{err}}[1,2] \\ R_{\text{err}}[0,2] - R_{\text{err}}[2,0] \\ R_{\text{err}}[1,0] - R_{\text{err}}[0,1] \end{bmatrix}$$
+
+```math
+\(\phi = \arccos\left(\frac{\operatorname{tr}(R_{\text{err}}) - 1}{2}\right), \qquad e_{\text{rot}} = \frac{\phi}{2\sin\phi} \begin{bmatrix} r_{32} - r_{23} \\ r_{13} - r_{31} \\ r_{21} - r_{12} \end{bmatrix} \%\%\)MAGIT_PARSER_PROTECT%%```
+
+где $r_{ij}$ — элементы матрицы относительного поворота $R_{\text{err}}$.
 
 ### Регуляризация шага (Damped Least Squares)
 
 Прямое обращение $\Delta q = J^{-1} e$ расходится вблизи сингулярностей, где $\det(J) \to 0$. Метод **Левенберга — Марквардта** добавляет коэффициент демпфирования $\lambda > 0$:
 
-$$\Delta q = \left(J^T J + \lambda I\right)^{-1} J^T e$$
+```math
+\(\Delta q = \left\)(J^T J \(+ \lambda I\right\))^{-1} J^T e
+```
 
 * При $\lambda \to 0$ алгоритм ведёт себя как быстрый метод Ньютона — Гаусса (квадратичная сходимость).
 * Вблизи сингулярностей демпфирование $\lambda I$ гарантирует обратимость матрицы и ограничивает скачки скоростей суставов.
