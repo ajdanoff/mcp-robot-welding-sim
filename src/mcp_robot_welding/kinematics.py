@@ -2,40 +2,47 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+from typing import Literal
 import numpy as np
 
 logger = logging.getLogger("mcp_robot_welding.kinematics")
 
+JointType = Literal["revolute", "prismatic"]
+
 
 @dataclass(frozen=True)
 class DHParameter:
-    a: float      # Link length (mm)
-    alpha: float  # Link twist (rad)
-    d: float      # Link offset (mm)
-    theta_offset: float = 0.0
+    a: float                      # Link length (mm)
+    alpha: float                  # Link twist (rad)
+    d: float                      # Link offset (mm)
+    theta_offset: float = 0.0     # Joint angle offset (rad)
+    joint_type: JointType = "revolute"
 
 
-class SixDofArm:
-    """Kinematic model of a 6-DoF industrial welding manipulator (KUKA/Mitsubishi style)."""
+class RobotManipulator:
+    """Generic N-DoF industrial manipulator supporting revolute and prismatic joints."""
 
-    def __init__(self) -> None:
-        self.dh_table: list[DHParameter] = [
-            DHParameter(a=150.0, alpha=-np.pi / 2, d=400.0),
-            DHParameter(a=550.0, alpha=0.0, d=0.0, theta_offset=-np.pi / 2),
-            DHParameter(a=120.0, alpha=-np.pi / 2, d=0.0),
-            DHParameter(a=0.0, alpha=np.pi / 2, d=500.0),
-            DHParameter(a=0.0, alpha=-np.pi / 2, d=0.0),
-            DHParameter(a=0.0, alpha=0.0, d=120.0),  # Welding torch TCP offset
-        ]
-        self.joint_limits: list[tuple[float, float]] = [
-            (-np.deg2rad(170), np.deg2rad(170)),
-            (-np.deg2rad(135), np.deg2rad(135)),
-            (-np.deg2rad(150), np.deg2rad(160)),
-            (-np.deg2rad(185), np.deg2rad(185)),
-            (-np.deg2rad(135), np.deg2rad(135)),
-            (-np.deg2rad(350), np.deg2rad(350)),
-        ]
-        self.max_reach_mm: float = 1350.0
+    def __init__(
+        self,
+        robot_type: str,
+        description: str,
+        dh_table: list[DHParameter],
+        joint_limits: list[tuple[float, float]],
+        seeds: list[np.ndarray],
+        max_reach_mm: float,
+        position_only_orientation: bool = False,
+    ) -> None:
+        if len(dh_table) != len(joint_limits):
+            raise ValueError("dh_table and joint_limits must have equal length.")
+
+        self.robot_type = robot_type
+        self.description = description
+        self.dh_table = dh_table
+        self.joint_limits = joint_limits
+        self.seeds = seeds
+        self.max_reach_mm = max_reach_mm
+        self.position_only_orientation = position_only_orientation
+        self.dof = len(dh_table)
 
     @staticmethod
     def _dh_transform(a: float, alpha: float, d: float, theta: float) -> np.ndarray:
@@ -57,72 +64,58 @@ class SixDofArm:
         t_current = np.eye(4, dtype=np.float64)
 
         for idx, param in enumerate(self.dh_table):
-            theta = float(joints.item(idx)) + param.theta_offset
-            t_link = self._dh_transform(
-                param.a,
-                param.alpha,
-                param.d,
-                theta,
-            )
+            q_val = float(joints.item(idx))
+            if param.joint_type == "prismatic":
+                theta = param.theta_offset
+                d = param.d + q_val
+            else:
+                theta = q_val + param.theta_offset
+                d = param.d
+
+            t_link = self._dh_transform(param.a, param.alpha, d, theta)
             t_current = t_current @ t_link
             frames.append(t_current.copy())
 
         return frames
 
-    def compute_jacobian(self, joints: np.ndarray) -> np.ndarray:
-        """
-        Computes the 6x6 geometric Jacobian.
-
-        Linear velocity is expressed in the base frame.
-        Angular velocity is expressed in the base frame.
-
-        For a revolute joint:
-            J_v = z_i x (p_tcp - p_i)
-            J_w = z_i
-        """
-        frames = self.forward_kinematics_chain(joints)
-        tcp_position = frames[-1][:3, 3]
-
-        jacobian = np.zeros((6, 6), dtype=np.float64)
-
-        for joint_index in range(6):
-            joint_frame = frames[joint_index]
-
-            joint_axis = joint_frame[:3, 2]
-            joint_origin = joint_frame[:3, 3]
-
-            jacobian[:3, joint_index] = np.cross(
-                joint_axis,
-                tcp_position - joint_origin,
-            )
-            jacobian[3:, joint_index] = joint_axis
-
-        return jacobian
-    
     def forward_kinematics(self, joints: np.ndarray) -> np.ndarray:
         """Returns 4x4 SE(3) pose of the welding torch TCP."""
         return self.forward_kinematics_chain(joints)[-1]
-    
+
+    def compute_jacobian(self, joints: np.ndarray) -> np.ndarray:
+        """
+        Computes the 6xN geometric Jacobian in the base frame.
+        - Revolute joint:  J_v = z_i x (p_tcp - p_i),  J_w = z_i
+        - Prismatic joint: J_v = z_i,                  J_w = 0
+        """
+        frames = self.forward_kinematics_chain(joints)
+        tcp_position = frames[-1][:3, 3]
+        jacobian = np.zeros((6, self.dof), dtype=np.float64)
+
+        for idx, param in enumerate(self.dh_table):
+            joint_frame = frames[idx]
+            joint_axis = joint_frame[:3, 2]
+            joint_origin = joint_frame[:3, 3]
+
+            if param.joint_type == "prismatic":
+                jacobian[:3, idx] = joint_axis
+                jacobian[3:, idx] = 0.0
+            else:
+                jacobian[:3, idx] = np.cross(joint_axis, tcp_position - joint_origin)
+                jacobian[3:, idx] = joint_axis
+
+        return jacobian
+
     @staticmethod
     def _rotation_error(
         current_rotation: np.ndarray,
         target_rotation: np.ndarray,
     ) -> np.ndarray:
-        """
-        Computes the rotation-vector error from current to target orientation.
-
-        The result is a 3D vector in the base frame.
-        """
+        """Computes 3D rotation-vector error on SO(3) from current to target."""
         rotation_error = target_rotation @ current_rotation.T
-
         angle = np.arccos(
-            np.clip(
-                (np.trace(rotation_error) - 1.0) / 2.0,
-                -1.0,
-                1.0,
-            )
+            np.clip((np.trace(rotation_error) - 1.0) / 2.0, -1.0, 1.0)
         )
-
         if angle < 1e-8:
             return np.zeros(3, dtype=np.float64)
 
@@ -136,44 +129,28 @@ class SixDofArm:
         ) / (2.0 * np.sin(angle))
 
         return axis * angle
-    
+
     def _clip_to_joint_limits(self, joints: np.ndarray) -> np.ndarray:
         clipped = joints.copy()
-
         for index, (lower, upper) in enumerate(self.joint_limits):
-            clipped[index] = np.clip(
-                float(clipped[index]),
-                lower,
-                upper,
-            )
-
+            clipped[index] = np.clip(float(clipped[index]), lower, upper)
         return clipped
-    
+
     def make_tool_orientation(self, tool_z_axis: np.ndarray) -> np.ndarray:
-        """
-        Builds a right-handed orientation matrix with the requested tool Z axis.
-        """
+        """Builds a right-handed SO(3) orientation matrix with the requested tool Z axis."""
         tool_z_axis = np.asarray(tool_z_axis, dtype=np.float64)
         tool_z_axis = tool_z_axis / np.linalg.norm(tool_z_axis)
 
         helper = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-
         if abs(float(np.dot(helper, tool_z_axis))) > 0.99:
             helper = np.array([0.0, 1.0, 0.0], dtype=np.float64)
 
         tool_x_axis = np.cross(helper, tool_z_axis)
         tool_x_axis = tool_x_axis / np.linalg.norm(tool_x_axis)
-
         tool_y_axis = np.cross(tool_z_axis, tool_x_axis)
 
-        return np.column_stack(
-            [
-                tool_x_axis,
-                tool_y_axis,
-                tool_z_axis,
-            ]
-        )
-        
+        return np.column_stack([tool_x_axis, tool_y_axis, tool_z_axis])
+
     def inverse_kinematics(
         self,
         target_pos: np.ndarray,
@@ -181,182 +158,223 @@ class SixDofArm:
         q_init: np.ndarray | None = None,
         max_iters: int = 500,
         pos_tol: float = 0.1,
-        rot_tol: float = 0.01,
+        rot_tol: float = 0.015,
     ) -> tuple[bool, np.ndarray, float]:
-        """
-        Solves 6-DoF welding torch IK using damped least squares.
-
-        When an initial joint configuration is provided, the solver searches
-        multiple seeds and selects the feasible solution with the smallest
-        joint-space jump relative to the initial configuration.
-        """
+        """Solves N-DoF IK using Damped Least Squares with multi-seed continuity search."""
         target_pos = np.asarray(target_pos, dtype=np.float64)
         target_distance = float(np.linalg.norm(target_pos))
 
         if target_distance > self.max_reach_mm:
             logger.warning(
-                "IK rejected: target distance %.1f mm exceeds max reach %.1f mm",
+                "[%s] IK rejected: distance %.1f mm > max_reach %.1f mm",
+                self.robot_type,
                 target_distance,
                 self.max_reach_mm,
             )
-
-            return False, np.zeros(6), target_distance
+            return False, np.zeros(self.dof, dtype=np.float64), target_distance
 
         if target_rot is None:
             target_rotation = self.make_tool_orientation(
                 np.array([0.0, 0.0, -1.0], dtype=np.float64)
             )
-
         else:
-            target_rotation = np.asarray(
-                target_rot,
-                dtype=np.float64,
-            )
+            target_rotation = np.asarray(target_rot, dtype=np.float64)
 
-        seeds = [
-            np.zeros(6, dtype=np.float64),
-            np.array(
-                [0.0, 0.2, 0.5, 0.0, 0.8, 0.0],
-                dtype=np.float64,
-            ),
-            np.array(
-                [0.0, -0.3, 0.8, 0.0, 0.9, 0.0],
-                dtype=np.float64,
-            ),
-        ]
+        candidate_seeds = [seed.copy() for seed in self.seeds]
+        if q_init is not None and q_init.shape == (self.dof,):
+            candidate_seeds.insert(0, np.asarray(q_init, dtype=np.float64).copy())
 
-        if q_init is not None:
-            seeds.insert(
-                0,
-                np.asarray(q_init, dtype=np.float64).copy(),
-            )
-
-        best_q = seeds[0].copy()
+        best_q = candidate_seeds[0].copy()
         best_position_error = float("inf")
 
         best_smooth_q: np.ndarray | None = None
         best_smooth_joint_jump = float("inf")
         best_smooth_position_error = float("inf")
 
-        for seed_index, seed in enumerate(seeds):
+        for seed in candidate_seeds:
             q = self._clip_to_joint_limits(seed.copy())
-
             position_error_norm = float("inf")
             orientation_error_norm = float("inf")
 
-            for iteration in range(max_iters):
+            for _ in range(max_iters):
                 current_pose = self.forward_kinematics(q)
-
                 current_position = current_pose[:3, 3]
                 current_rotation = current_pose[:3, :3]
 
                 position_error = target_pos - current_position
+                position_error_norm = float(np.linalg.norm(position_error))
 
-                orientation_error = self._rotation_error(
-                    current_rotation,
-                    target_rotation,
-                )
+                if self.position_only_orientation:
+                    # SCARA mode: tool Z stays vertical (-Z), control yaw around Z
+                    yaw_cur = float(np.arctan2(current_rotation[1, 0], current_rotation[0, 0]))
+                    yaw_tgt = float(np.arctan2(target_rotation[1, 0], target_rotation[0, 0]))
+                    yaw_err = float(np.arctan2(np.sin(yaw_tgt - yaw_cur), np.cos(yaw_tgt - yaw_cur)))
+                    orientation_error = np.array([0.0, 0.0, yaw_err], dtype=np.float64)
+                else:
+                    orientation_error = self._rotation_error(current_rotation, target_rotation)
 
-                position_error_norm = float(
-                    np.linalg.norm(position_error)
-                )
-
-                orientation_error_norm = float(
-                    np.linalg.norm(orientation_error)
-                )
+                orientation_error_norm = float(np.linalg.norm(orientation_error))
 
                 if position_error_norm < best_position_error:
                     best_position_error = position_error_norm
                     best_q = q.copy()
 
-                if (
-                    position_error_norm < pos_tol
-                    and orientation_error_norm < rot_tol
-                ):
-                    logger.debug(
-                        "IK candidate found: seed=%d iteration=%d "
-                        "position_error=%.4f mm "
-                        "orientation_error=%.6f",
-                        seed_index,
-                        iteration,
-                        position_error_norm,
-                        orientation_error_norm,
-                    )
-
+                if position_error_norm < pos_tol and orientation_error_norm < rot_tol:
                     if q_init is None:
-                        return (
-                            True,
-                            q,
-                            position_error_norm,
-                        )
+                        return True, q, position_error_norm
 
-                    joint_jump = float(
-                        np.max(np.abs(q - q_init))
-                    )
-
+                    joint_jump = self._normalized_joint_jump(q, q_init)
                     if joint_jump < best_smooth_joint_jump:
                         best_smooth_q = q.copy()
                         best_smooth_joint_jump = joint_jump
-                        best_smooth_position_error = (
-                            position_error_norm
-                        )
+                        best_smooth_position_error = position_error_norm
 
-                error_vector = np.concatenate(
-                    [
-                        position_error,
-                        orientation_error,
-                    ]
-                )
-
+                error_vector = np.concatenate([position_error, orientation_error])
                 jacobian = self.compute_jacobian(q)
-
                 damping = 1e-4
 
                 delta_q = np.linalg.solve(
-                    jacobian.T @ jacobian
-                    + damping * np.eye(6),
+                    jacobian.T @ jacobian + damping * np.eye(self.dof),
                     jacobian.T @ error_vector,
                 )
 
-                max_delta = float(np.max(np.abs(delta_q)))
-
-                if max_delta > 0.3:
-                    delta_q *= 0.3 / max_delta
+                # Scale step for revolute joints (rad) vs prismatic joints (mm)
+                for idx, param in enumerate(self.dh_table):
+                    max_step = 25.0 if param.joint_type == "prismatic" else 0.3
+                    if abs(float(delta_q[idx])) > max_step:
+                        delta_q[idx] *= max_step / abs(float(delta_q[idx]))
 
                 q = self._clip_to_joint_limits(q + delta_q)
 
-            logger.debug(
-                "IK seed finished: seed=%d "
-                "final_position_error=%.2f mm "
-                "final_orientation_error=%.6f",
-                seed_index,
-                position_error_norm,
-                orientation_error_norm,
-            )
-
         if best_smooth_q is not None:
-            logger.debug(
-                "IK selected smoothest solution: "
-                "joint_jump=%.2f degrees "
-                "position_error=%.4f mm",
-                np.rad2deg(best_smooth_joint_jump),
-                best_smooth_position_error,
-            )
+            return True, best_smooth_q, best_smooth_position_error
 
-            return (
-                True,
-                best_smooth_q,
-                best_smooth_position_error,
+        return best_position_error <= pos_tol, best_q, best_position_error
+    
+    def _normalized_joint_jump(self, q_new: np.ndarray, q_old: np.ndarray) -> float:
+        """Computes max joint jump in equivalent degrees (10 mm prismatic ~= 5 deg)."""
+        max_jump_deg = 0.0
+        for idx, param in enumerate(self.dh_table):
+            diff = abs(float(q_new[idx]) - float(q_old[idx]))
+            jump_deg = (
+                (diff * 0.5)
+                if param.joint_type == "prismatic"
+                else float(np.rad2deg(diff))
             )
+            max_jump_deg = max(max_jump_deg, jump_deg)
+        return max_jump_deg
 
-        logger.warning(
-            "IK failed across all seeds: "
-            "best_position_error=%.2f mm",
-            best_position_error,
+
+SUPPORTED_ROBOTS: dict[str, str] = {
+    "industrial_6dof": "6-DoF Industrial Welding Arm with Spherical Wrist (KUKA/Mitsubishi style)",
+    "cobot_6dof": "6-DoF Collaborative Welding Arm with Offset Wrist (UR5/UR10 style)",
+    "scara_4dof": "4-DoF SCARA Vertical Spot-Welding Robot (R-R-P-R kinematic chain)",
+}
+
+
+def create_manipulator(robot_type: str = "industrial_6dof") -> RobotManipulator:
+    """Factory creating configured kinematic models for supported industrial robots."""
+    key = robot_type.strip().lower()
+
+    if key == "industrial_6dof":
+        return RobotManipulator(
+            robot_type="industrial_6dof",
+            description=SUPPORTED_ROBOTS["industrial_6dof"],
+            dh_table=[
+                DHParameter(a=150.0, alpha=-np.pi / 2, d=400.0),
+                DHParameter(a=550.0, alpha=0.0, d=0.0, theta_offset=-np.pi / 2),
+                DHParameter(a=120.0, alpha=-np.pi / 2, d=0.0),
+                DHParameter(a=0.0, alpha=np.pi / 2, d=500.0),
+                DHParameter(a=0.0, alpha=-np.pi / 2, d=0.0),
+                DHParameter(a=0.0, alpha=0.0, d=120.0),
+            ],
+            joint_limits=[
+                (-np.deg2rad(170), np.deg2rad(170)),
+                (-np.deg2rad(135), np.deg2rad(135)),
+                (-np.deg2rad(150), np.deg2rad(160)),
+                (-np.deg2rad(185), np.deg2rad(185)),
+                (-np.deg2rad(135), np.deg2rad(135)),
+                (-np.deg2rad(350), np.deg2rad(350)),
+            ],
+            seeds=[
+                np.zeros(6, dtype=np.float64),
+                np.array([0.0, 0.2, 0.5, 0.0, 0.8, 0.0], dtype=np.float64),
+                np.array([0.0, -0.3, 0.8, 0.0, 0.9, 0.0], dtype=np.float64),
+            ],
+            max_reach_mm=1350.0,
         )
 
-        return (
-            best_position_error <= pos_tol,
-            best_q,
-            best_position_error,
+    if key == "cobot_6dof":
+        # Non-spherical offset wrist (UR5e/UR10e-inspired geometry, reach ~1100 mm)
+        return RobotManipulator(
+            robot_type="cobot_6dof",
+            description=SUPPORTED_ROBOTS["cobot_6dof"],
+            dh_table=[
+                DHParameter(a=0.0, alpha=np.pi / 2, d=180.0),
+                DHParameter(a=-500.0, alpha=0.0, d=0.0),
+                DHParameter(a=-450.0, alpha=0.0, d=0.0),
+                DHParameter(a=0.0, alpha=np.pi / 2, d=130.0),
+                DHParameter(a=0.0, alpha=-np.pi / 2, d=100.0),
+                DHParameter(a=0.0, alpha=0.0, d=110.0),
+            ],
+            joint_limits=[
+                (-np.pi, np.pi),
+                (-np.pi, np.pi),
+                (-np.deg2rad(165), np.deg2rad(165)),
+                (-np.pi, np.pi),
+                (-np.pi, np.pi),
+                (-2.0 * np.pi, 2.0 * np.pi),
+            ],
+            seeds=[
+                np.array([2.9, -2.1, 1.5, -1.0, -1.57, 0.0], dtype=np.float64),
+                np.array([-2.9, -2.1, 1.5, -1.0, -1.57, 0.0], dtype=np.float64),
+                np.array([3.14, -1.8, 1.2, -1.0, -1.57, 0.0], dtype=np.float64),
+            ],
+            max_reach_mm=1200.0,
         )
+
+    if key == "scara_4dof":
+        # 4-DoF R-R-P-R SCARA: horizontal reach 450 + 400 = 850 mm, vertical Z quill [0..350 mm]
+        return RobotManipulator(
+            robot_type="scara_4dof",
+            description=SUPPORTED_ROBOTS["scara_4dof"],
+            dh_table=[
+                DHParameter(a=450.0, alpha=0.0, d=520.0, joint_type="revolute"),
+                DHParameter(a=400.0, alpha=np.pi, d=0.0, joint_type="revolute"),
+                DHParameter(a=0.0, alpha=0.0, d=0.0, joint_type="prismatic"),
+                DHParameter(a=0.0, alpha=0.0, d=60.0, joint_type="revolute"),
+            ],
+            joint_limits=[
+                (-np.deg2rad(150), np.deg2rad(150)),
+                (-np.deg2rad(145), np.deg2rad(145)),
+                (0.0, 350.0),  # Prismatic vertical stroke in mm
+                (-np.pi, np.pi),
+            ],
+            seeds=[
+                np.array([0.4, -0.8, 100.0, 0.0], dtype=np.float64),
+                np.array([-0.4, 0.8, 100.0, 0.0], dtype=np.float64),
+            ],
+            max_reach_mm=1100.0,
+            position_only_orientation=True,
+        )
+
+    raise ValueError(
+        f"Unknown robot_type '{robot_type}'. Supported models: {sorted(SUPPORTED_ROBOTS.keys())}."
+    )
+
+
+class SixDofArm(RobotManipulator):
+    """Backward-compatible default 6-DoF industrial manipulator."""
+
+    def __init__(self) -> None:
+        default_arm = create_manipulator("industrial_6dof")
+        super().__init__(
+            robot_type=default_arm.robot_type,
+            description=default_arm.description,
+            dh_table=default_arm.dh_table,
+            joint_limits=default_arm.joint_limits,
+            seeds=default_arm.seeds,
+            max_reach_mm=default_arm.max_reach_mm,
+        )
+
+
