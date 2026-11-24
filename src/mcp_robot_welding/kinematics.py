@@ -3,24 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from typing import Literal
+
 import numpy as np
+
 
 logger = logging.getLogger("mcp_robot_welding.kinematics")
 
+
 JointType = Literal["revolute", "prismatic"]
-OrientationMode = Literal["full_so3", "yaw_only"]
 
 
 @dataclass(frozen=True)
 class DHParameter:
-    """
-    Standard Denavit-Hartenberg (DH) parameters for a single manipulator link.
+    """One standard-DH transform.
 
-    Units:
-        - a: link length in millimeters (mm)
-        - alpha: link twist in radians (rad)
-        - d: link offset along Z in millimeters (mm)
-        - theta_offset: home joint angle offset in radians (rad)
+    Lengths are in millimetres and angles are in radians.
     """
 
     a: float
@@ -31,7 +28,7 @@ class DHParameter:
 
 
 class RobotManipulator:
-    """Generic N-DoF industrial manipulator supporting revolute and prismatic joints."""
+    """Generic N-DoF industrial manipulator with revolute and prismatic joints."""
 
     def __init__(
         self,
@@ -41,34 +38,80 @@ class RobotManipulator:
         joint_limits: list[tuple[float, float]],
         seeds: list[np.ndarray],
         max_reach_mm: float,
-        orientation_mode: OrientationMode = "full_so3",
-        prismatic_mm_per_equiv_deg: float = 2.0,
+        position_only_orientation: bool = False,
+        tool_z_points_into_workpiece: bool = True,
     ) -> None:
+        if not robot_type:
+            raise ValueError("robot_type must not be empty.")
+        if not description:
+            raise ValueError("description must not be empty.")
+
         if len(dh_table) != len(joint_limits):
-            raise ValueError("dh_table and joint_limits must have equal length.")
+            raise ValueError(
+                "dh_table and joint_limits must have equal length."
+            )
+
+        if not dh_table:
+            raise ValueError("dh_table must contain at least one joint.")
+
+        if max_reach_mm <= 0.0:
+            raise ValueError("max_reach_mm must be positive.")
+
+        if not seeds:
+            raise ValueError("At least one IK seed is required.")
 
         self.robot_type = robot_type
         self.description = description
-        self.dh_table = dh_table
-        self.joint_limits = joint_limits
-        self.seeds = seeds
-        self.max_reach_mm = max_reach_mm
-        self.orientation_mode = orientation_mode
-        self.prismatic_mm_per_equiv_deg = prismatic_mm_per_equiv_deg
-        self.dof = len(dh_table)
+        self.dh_table = list(dh_table)
+        self.joint_limits = list(joint_limits)
+        self.seeds = [np.asarray(seed, dtype=np.float64).copy() for seed in seeds]
+        self.max_reach_mm = float(max_reach_mm)
+        self.position_only_orientation = bool(position_only_orientation)
+        self.tool_z_points_into_workpiece = bool(
+            tool_z_points_into_workpiece
+        )
+        self.dof = len(self.dh_table)
 
-    def _validate_joints(self, joints: np.ndarray) -> np.ndarray:
-        q = np.asarray(joints, dtype=np.float64)
-        if q.shape != (self.dof,):
-            raise ValueError(
-                f"[{self.robot_type}] Expected joints shape ({self.dof},), got {q.shape}."
-            )
-        return q
+        for index, seed in enumerate(self.seeds):
+            if seed.shape != (self.dof,):
+                raise ValueError(
+                    f"Seed {index} must have shape ({self.dof},); "
+                    f"got {seed.shape}."
+                )
+
+            if not np.all(np.isfinite(seed)):
+                raise ValueError(f"Seed {index} contains non-finite values.")
+
+        for index, (lower, upper) in enumerate(self.joint_limits):
+            if not np.isfinite(lower) or not np.isfinite(upper):
+                raise ValueError(
+                    f"Joint limit {index} contains non-finite values."
+                )
+
+            if lower > upper:
+                raise ValueError(
+                    f"Joint limit {index}: lower bound exceeds upper bound."
+                )
+
+        for index, parameter in enumerate(self.dh_table):
+            values = (parameter.a, parameter.alpha, parameter.d, parameter.theta_offset)
+
+            if not all(np.isfinite(value) for value in values):
+                raise ValueError(
+                    f"DH parameter {index} contains non-finite values."
+                )
 
     @staticmethod
-    def _dh_transform(a: float, alpha: float, d: float, theta: float) -> np.ndarray:
+    def _dh_transform(
+        a: float,
+        alpha: float,
+        d: float,
+        theta: float,
+    ) -> np.ndarray:
+        """Standard DH transform: Rz(theta) Tz(d) Tx(a) Rx(alpha)."""
         ct, st = np.cos(theta), np.sin(theta)
         ca, sa = np.cos(alpha), np.sin(alpha)
+
         return np.array(
             [
                 [ct, -st * ca, st * sa, a * ct],
@@ -79,56 +122,87 @@ class RobotManipulator:
             dtype=np.float64,
         )
 
-    def forward_kinematics_chain(self, joints: np.ndarray) -> list[np.ndarray]:
-        """Returns homogeneous 4x4 SE(3) matrices for base and every joint frame."""
-        q = self._validate_joints(joints)
+    def _validate_joint_vector(self, joints: np.ndarray) -> np.ndarray:
+        joints = np.asarray(joints, dtype=np.float64)
+
+        if joints.shape != (self.dof,):
+            raise ValueError(
+                f"joints must have shape ({self.dof},); got {joints.shape}."
+            )
+
+        if not np.all(np.isfinite(joints)):
+            raise ValueError("joints must contain only finite values.")
+
+        return joints
+
+    def forward_kinematics_chain(
+        self,
+        joints: np.ndarray,
+    ) -> list[np.ndarray]:
+        """Returns homogeneous transforms for the base and every joint frame."""
+        joints = self._validate_joint_vector(joints)
+
         frames: list[np.ndarray] = [np.eye(4, dtype=np.float64)]
-        t_current = np.eye(4, dtype=np.float64)
+        current_transform = np.eye(4, dtype=np.float64)
 
-        for idx, param in enumerate(self.dh_table):
-            q_val = float(q[idx])
-            if param.joint_type == "prismatic":
-                theta = param.theta_offset
-                d = param.d + q_val
+        for index, parameter in enumerate(self.dh_table):
+            joint_value = float(joints[index])
+
+            if parameter.joint_type == "prismatic":
+                theta = parameter.theta_offset
+                d = parameter.d + joint_value
             else:
-                theta = q_val + param.theta_offset
-                d = param.d
+                theta = joint_value + parameter.theta_offset
+                d = parameter.d
 
-            t_link = self._dh_transform(param.a, param.alpha, d, theta)
-            t_current = t_current @ t_link
-            frames.append(t_current.copy())
+            link_transform = self._dh_transform(
+                parameter.a,
+                parameter.alpha,
+                d,
+                theta,
+            )
+
+            current_transform = current_transform @ link_transform
+            frames.append(current_transform.copy())
 
         return frames
 
     def forward_kinematics(self, joints: np.ndarray) -> np.ndarray:
-        """Returns 4x4 SE(3) pose of the welding torch TCP."""
+        """Returns the 4x4 SE(3) pose of the welding-tool TCP."""
         return self.forward_kinematics_chain(joints)[-1]
 
-    def compute_jacobian_from_frames(self, frames: list[np.ndarray]) -> np.ndarray:
-        """
-        Computes the 6xN geometric Jacobian from precomputed FK frames.
-        - Revolute joint:  J_v = z_i x (p_tcp - p_i),  J_w = z_i
-        - Prismatic joint: J_v = z_i,                  J_w = 0
-        """
+    def compute_jacobian_from_frames(
+        self,
+        frames: list[np.ndarray],
+    ) -> np.ndarray:
+        """Computes the 6xN geometric Jacobian from precomputed FK frames."""
+        if len(frames) != self.dof + 1:
+            raise ValueError(
+                f"Expected {self.dof + 1} FK frames; got {len(frames)}."
+            )
+
         tcp_position = frames[-1][:3, 3]
         jacobian = np.zeros((6, self.dof), dtype=np.float64)
 
-        for idx, param in enumerate(self.dh_table):
-            joint_frame = frames[idx]
+        for index, parameter in enumerate(self.dh_table):
+            joint_frame = frames[index]
             joint_axis = joint_frame[:3, 2]
             joint_origin = joint_frame[:3, 3]
 
-            if param.joint_type == "prismatic":
-                jacobian[:3, idx] = joint_axis
-                jacobian[3:, idx] = 0.0
+            if parameter.joint_type == "prismatic":
+                jacobian[:3, index] = joint_axis
+                jacobian[3:, index] = 0.0
             else:
-                jacobian[:3, idx] = np.cross(joint_axis, tcp_position - joint_origin)
-                jacobian[3:, idx] = joint_axis
+                jacobian[:3, index] = np.cross(
+                    joint_axis,
+                    tcp_position - joint_origin,
+                )
+                jacobian[3:, index] = joint_axis
 
         return jacobian
 
     def compute_jacobian(self, joints: np.ndarray) -> np.ndarray:
-        """Computes the 6xN geometric Jacobian in the base frame."""
+        """Computes the 6xN geometric Jacobian in the robot base frame."""
         frames = self.forward_kinematics_chain(joints)
         return self.compute_jacobian_from_frames(frames)
 
@@ -138,59 +212,100 @@ class RobotManipulator:
         target_rotation: np.ndarray,
     ) -> np.ndarray:
         """
-        Computes numerically stable 3D rotation-vector error on SO(3),
-        including explicit handling near angle = pi where sin(angle) -> 0.
+        Computes the rotation-vector error from current to target orientation.
+
+        The result is expressed in the base frame, matching the angular rows
+        of the geometric Jacobian.
         """
-        r_err = target_rotation @ current_rotation.T
-        cos_angle = float(np.clip((np.trace(r_err) - 1.0) / 2.0, -1.0, 1.0))
-        angle = float(np.arccos(cos_angle))
+        current_rotation = np.asarray(current_rotation, dtype=np.float64)
+        target_rotation = np.asarray(target_rotation, dtype=np.float64)
+
+        if current_rotation.shape != (3, 3) or target_rotation.shape != (3, 3):
+            raise ValueError("Rotation matrices must have shape (3, 3).")
+
+        error_rotation = target_rotation @ current_rotation.T
+        trace = float(np.trace(error_rotation))
+        cosine_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+        angle = float(np.arccos(cosine_angle))
 
         if angle < 1e-8:
             return np.zeros(3, dtype=np.float64)
 
-        # Near pi, extract rotation axis from symmetric part (R + I) / 2
-        if np.pi - angle < 1e-4:
-            diag = np.maximum(0.0, (np.diag(r_err) + 1.0) / 2.0)
-            axis = np.sqrt(diag)
-            if r_err.item(2, 1) - r_err.item(1, 2) < 0:
-                axis[0] = -float(axis.item(0))
-            if r_err.item(0, 2) - r_err.item(2, 0) < 0:
-                axis[1] = -float(axis.item(1))
-            if r_err.item(1, 0) - r_err.item(0, 1) < 0:
-                axis[2] = -float(axis.item(2))
-            norm = float(np.linalg.norm(axis))
-            if norm > 1e-8:
-                return (axis / norm) * angle
-
-        axis = np.array(
+        skew = np.array(
             [
-                r_err.item(2, 1) - r_err.item(1, 2),
-                r_err.item(0, 2) - r_err.item(2, 0),
-                r_err.item(1, 0) - r_err.item(0, 1),
+                error_rotation[2, 1] - error_rotation[1, 2],
+                error_rotation[0, 2] - error_rotation[2, 0],
+                error_rotation[1, 0] - error_rotation[0, 1],
             ],
             dtype=np.float64,
-        ) / (2.0 * np.sin(angle))
+        )
 
-        return axis * angle
+        sine_angle = float(np.sin(angle))
+
+        # Near 180 degrees, use the symmetric part of R to recover the axis.
+        if sine_angle < 1e-6:
+            symmetric = (error_rotation + error_rotation.T) / 2.0
+            axis = np.real(np.linalg.eigvals(symmetric))
+
+            # Eigenvector associated with eigenvalue 1 is the rotation axis.
+            eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
+            axis = eigenvectors[:, int(np.argmax(eigenvalues))]
+
+            if np.dot(axis, skew) < 0.0:
+                axis = -axis
+
+            axis = axis / np.linalg.norm(axis)
+            return axis * angle
+
+        return (skew / (2.0 * sine_angle)) * angle
+
+    def _wrap_revolute_joint(
+        self,
+        value: float,
+        lower: float,
+        upper: float,
+    ) -> float:
+        # Only wrap joints whose physical range is strictly [-pi, pi]
+        # if np.isclose(lower, -np.pi) and np.isclose(upper, np.pi):
+        #     return (value + np.pi) % (2.0 * np.pi) - np.pi
+
+        return value
 
 
     def _clip_to_joint_limits(self, joints: np.ndarray) -> np.ndarray:
+        joints = self._validate_joint_vector(joints)
         clipped = joints.copy()
+
         for index, (lower, upper) in enumerate(self.joint_limits):
             value = float(clipped[index])
+
             if self.dh_table[index].joint_type == "revolute":
-                if (upper - lower) >= 2.0 * np.pi:
-                    value = (value + np.pi) % (2.0 * np.pi) - np.pi
+                value = self._wrap_revolute_joint(value, lower, upper)
+
             clipped[index] = np.clip(value, lower, upper)
+
         return clipped
 
-    def make_tool_orientation(self, tool_z_axis: np.ndarray) -> np.ndarray:
-        """Builds a right-handed SO(3) orientation matrix with the requested tool Z axis."""
-        tool_z_axis = np.asarray(tool_z_axis, dtype=np.float64).reshape(3)
+    def make_tool_orientation(
+        self,
+        tool_z_axis: np.ndarray,
+        reference_x_axis: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Builds a right-handed SO(3) matrix whose tool Z axis is requested."""
+        tool_z_axis = _as_vector3(tool_z_axis, "tool_z_axis")
+
         norm = float(np.linalg.norm(tool_z_axis))
         if norm < 1e-9:
-            raise ValueError("tool_z_axis must be a non-zero 3D vector.")
+            raise ValueError("tool_z_axis must be non-zero.")
+
         tool_z_axis = tool_z_axis / norm
+
+        if reference_x_axis is not None:
+            proj = reference_x_axis - np.dot(reference_x_axis, tool_z_axis) * tool_z_axis
+            if float(np.linalg.norm(proj)) > 1e-6:
+                tool_x_axis = proj / np.linalg.norm(proj)
+                tool_y_axis = np.cross(tool_z_axis, tool_x_axis)
+                return np.column_stack([tool_x_axis, tool_y_axis, tool_z_axis])
 
         helper = np.array([1.0, 0.0, 0.0], dtype=np.float64)
         if abs(float(np.dot(helper, tool_z_axis))) > 0.99:
@@ -202,6 +317,146 @@ class RobotManipulator:
 
         return np.column_stack([tool_x_axis, tool_y_axis, tool_z_axis])
 
+
+    def default_tool_orientation(self) -> np.ndarray:
+        """
+        Returns the default torch orientation.
+
+        For `tool_z_points_into_workpiece=True`, the tool Z axis points
+        downward, along base -Z. This is the usual convention when the TCP
+        Z axis points from the torch toward the workpiece.
+        """
+        if self.tool_z_points_into_workpiece:
+            requested_axis = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        else:
+            requested_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        return self.make_tool_orientation(requested_axis)
+
+    def joint_jump(
+        self,
+        q_new: np.ndarray,
+        q_old: np.ndarray,
+    ) -> float:
+        """
+        Returns the largest normalized joint-space jump.
+
+        Revolute differences are wrapped to the shortest angular path.
+        Prismatic motion is converted using 10 mm equivalent to 5 degrees;
+        this is a planning heuristic, not a physical unit conversion.
+        """
+        q_new = self._validate_joint_vector(q_new)
+        q_old = self._validate_joint_vector(q_old)
+
+        maximum_jump_deg = 0.0
+
+        for index, parameter in enumerate(self.dh_table):
+            difference = float(q_new[index] - q_old[index])
+
+            if parameter.joint_type == "revolute":
+                difference = self._normalize_angle_difference(difference)
+                jump_deg = float(np.rad2deg(abs(difference)))
+            else:
+                jump_deg = abs(difference) * 0.5
+
+            maximum_jump_deg = max(maximum_jump_deg, jump_deg)
+
+        return maximum_jump_deg
+
+    def _normalized_joint_jump(
+        self,
+        q_new: np.ndarray,
+        q_old: np.ndarray,
+    ) -> float:
+        """Backward-compatible alias for `joint_jump()`."""
+        return self.joint_jump(q_new, q_old)
+    
+    @staticmethod
+    def _rotation_to_quaternion(
+        rotation: np.ndarray,
+    ) -> np.ndarray:
+        """Converts a 3x3 rotation matrix to a quaternion [w, x, y, z]."""
+        rotation = np.asarray(rotation, dtype=np.float64)
+        trace = float(np.trace(rotation))
+
+        if trace > 0.0:
+            scale = np.sqrt(trace + 1.0) * 2.0
+            scalar = 0.25 * scale
+            x = (rotation[2, 1] - rotation[1, 2]) / scale
+            y = (rotation[0, 2] - rotation[2, 0]) / scale
+            z = (rotation[1, 0] - rotation[0, 1]) / scale
+        elif (
+            rotation[0, 0] > rotation[1, 1]
+            and rotation[0, 0] > rotation[2, 2]
+        ):
+            scale = np.sqrt(
+                1.0
+                + rotation[0, 0]
+                - rotation[1, 1]
+                - rotation[2, 2]
+            ) * 2.0
+            scalar = (rotation[2, 1] - rotation[1, 2]) / scale
+            x = 0.25 * scale
+            y = (rotation[0, 1] + rotation[1, 0]) / scale
+            z = (rotation[0, 2] + rotation[2, 0]) / scale
+        elif rotation[1, 1] > rotation[2, 2]:
+            scale = np.sqrt(
+                1.0
+                + rotation[1, 1]
+                - rotation[0, 0]
+                - rotation[2, 2]
+            ) * 2.0
+            scalar = (rotation[0, 2] - rotation[2, 0]) / scale
+            x = (rotation[0, 1] + rotation[1, 0]) / scale
+            y = 0.25 * scale
+            z = (rotation[1, 2] + rotation[2, 1]) / scale
+        else:
+            scale = np.sqrt(
+                1.0
+                + rotation[2, 2]
+                - rotation[0, 0]
+                - rotation[1, 1]
+            ) * 2.0
+            scalar = (rotation[1, 0] - rotation[0, 1]) / scale
+            x = (rotation[0, 2] + rotation[2, 0]) / scale
+            y = (rotation[1, 2] + rotation[2, 1]) / scale
+            z = 0.25 * scale
+
+        return np.array([scalar, x, y, z], dtype=np.float64)
+
+    @staticmethod
+    def _rotation_error(
+        current_rotation: np.ndarray,
+        target_rotation: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Returns the SO(3) logarithm of target_rotation @ current_rotation.T.
+
+        The result is a rotation vector in the base frame.
+        """
+        current_rotation = np.asarray(current_rotation, dtype=np.float64)
+        target_rotation = np.asarray(target_rotation, dtype=np.float64)
+
+        error_rotation = target_rotation @ current_rotation.T
+        quaternion = RobotManipulator._rotation_to_quaternion(error_rotation)
+        quaternion = quaternion / np.linalg.norm(quaternion)
+
+        scalar = float(quaternion[0])
+        vector = quaternion[1:]
+        vector_norm = float(np.linalg.norm(vector))
+
+        if vector_norm < 1e-12:
+            return np.zeros(3, dtype=np.float64)
+
+        if scalar < 0.0:
+            scalar = -scalar
+            vector = -vector
+
+        angle = 2.0 * float(np.arctan2(vector_norm, scalar))
+        axis = vector / vector_norm
+
+        return axis * angle
+
     def inverse_kinematics(
         self,
         target_pos: np.ndarray,
@@ -210,181 +465,476 @@ class RobotManipulator:
         max_iters: int = 500,
         pos_tol: float = 0.1,
         rot_tol: float = 0.015,
-        max_allowed_joint_jump_deg: float = 45.0,
+        position_weight: float = 1.0,
+        orientation_weight: float = 20.0,
+        initial_damping: float = 0.05,
+        minimum_damping: float = 1e-4,
+        maximum_damping: float = 5.0,
+        max_step_norm: float = 0.35,
+        max_joint_jump_deg: float | None = None,
     ) -> tuple[bool, np.ndarray, float]:
         """
-        Solves N-DoF IK using unit-scaled, adaptive Damped Least Squares
-        in 6D task space: delta_q = J^T (J J^T + lambda^2 I)^-1 e.
+        Solves N-DoF inverse kinematics using damped least squares.
+
+        The solver minimizes a weighted position/orientation residual and uses
+        backtracking to reject steps that increase the task error. When `q_init`
+        is supplied, it prefers the valid solution with the smallest normalized
+        joint-space jump from that initial configuration.
+
+        Returns:
+            A tuple of `(success, joint_positions, position_error_mm)`.
         """
-        target_position = np.asarray(target_pos, dtype=np.float64)
-        if target_position.shape != (3,):
-            raise ValueError(f"Expected target_pos shape (3,), got {target_position.shape}.")
+        target_position = _as_vector3(target_pos, "target_pos")
+
+        if target_rot is None:
+            target_rotation = self.default_tool_orientation()
+        else:
+            target_rotation = np.asarray(target_rot, dtype=np.float64)
+
+            if target_rotation.shape != (3, 3):
+                raise ValueError(
+                    "target_rot must be a 3x3 rotation matrix."
+                )
+
+            if not np.all(np.isfinite(target_rotation)):
+                raise ValueError(
+                    "target_rot must contain only finite values."
+                )
+
+        if max_iters < 1:
+            raise ValueError("max_iters must be at least 1.")
+
+        if pos_tol < 0.0 or rot_tol < 0.0:
+            raise ValueError("Tolerances must be non-negative.")
+
+        if position_weight <= 0.0 or orientation_weight < 0.0:
+            raise ValueError(
+                "position_weight must be positive and orientation_weight "
+                "must be non-negative."
+            )
+
+        if not (
+            minimum_damping
+            <= initial_damping
+            <= maximum_damping
+        ):
+            raise ValueError(
+                "Damping values must satisfy "
+                "minimum_damping <= initial_damping <= maximum_damping."
+            )
+
+        if max_step_norm <= 0.0:
+            raise ValueError("max_step_norm must be positive.")
 
         target_distance = float(np.linalg.norm(target_position))
+
         if target_distance > self.max_reach_mm:
             logger.warning(
-                "[%s] IK reach heuristic rejected: %.1f mm > %.1f mm",
+                "[%s] IK rejected by coarse reach check: "
+                "distance %.1f mm > max_reach %.1f mm.",
                 self.robot_type,
                 target_distance,
                 self.max_reach_mm,
             )
-            return False, np.zeros(self.dof, dtype=np.float64), target_distance
-
-        if target_rot is None:
-            target_rotation = self.make_tool_orientation(
-                np.array([0.0, 0.0, -1.0], dtype=np.float64)
+            return (
+                False,
+                np.zeros(self.dof, dtype=np.float64),
+                target_distance,
             )
-        else:
-            target_rotation = np.asarray(target_rot, dtype=np.float64)
-            if target_rotation.shape != (3, 3):
-                raise ValueError(f"Expected target_rot shape (3, 3), got {target_rotation.shape}.")
 
-        validated_q_init = self._validate_joints(q_init) if q_init is not None else None
-        candidate_seeds = [seed.copy() for seed in self.seeds]
-        if validated_q_init is not None:
-            candidate_seeds.insert(0, validated_q_init.copy())
+        def evaluate(
+            joints: np.ndarray,
+        ) -> tuple[
+            list[np.ndarray],
+            np.ndarray,
+            np.ndarray,
+            float,
+            float,
+            float,
+        ]:
+            frames = self.forward_kinematics_chain(joints)
+            pose = frames[-1]
 
-        best_q = next(iter(candidate_seeds)).copy()
-        best_position_error = float("inf")
+            position_error = target_position - pose[:3, 3]
+            position_error_norm = float(
+                np.linalg.norm(position_error)
+            )
 
-        best_smooth_q: np.ndarray | None = None
-        best_smooth_joint_jump = float("inf")
-        best_smooth_position_error = float("inf")
+            if self.position_only_orientation:
+                current_rotation = pose[:3, :3]
 
-        # Explicit unit scaling: 1 rad orientation error ~= 50 mm position error
-        position_weight = 1.0
-        orientation_weight = 50.0
+                current_yaw = float(
+                    np.arctan2(
+                        current_rotation[1, 0],
+                        current_rotation[0, 0],
+                    )
+                )
+                target_yaw = float(
+                    np.arctan2(
+                        target_rotation[1, 0],
+                        target_rotation[0, 0],
+                    )
+                )
+
+                yaw_error = float(
+                    np.arctan2(
+                        np.sin(target_yaw - current_yaw),
+                        np.cos(target_yaw - current_yaw),
+                    )
+                )
+
+                rotation_error = np.array(
+                    [0.0, 0.0, yaw_error],
+                    dtype=np.float64,
+                )
+            else:
+                rotation_error = self._rotation_error(
+                    pose[:3, :3],
+                    target_rotation,
+                )
+
+            rotation_error_norm = float(
+                np.linalg.norm(rotation_error)
+            )
+
+            weighted_error = np.concatenate(
+                [
+                    position_weight * position_error,
+                    orientation_weight * rotation_error,
+                ]
+            )
+
+            task_cost = 0.5 * float(
+                weighted_error @ weighted_error
+            )
+
+            return (
+                frames,
+                position_error,
+                rotation_error,
+                position_error_norm,
+                rotation_error_norm,
+                task_cost,
+            )
+
+        candidate_seeds = [
+            seed.copy() for seed in self.seeds
+        ]
+
+        if q_init is not None:
+            initial_joints = self._validate_joint_vector(q_init)
+            candidate_seeds.insert(0, initial_joints.copy())
+
+        best_fallback_q = candidate_seeds[0].copy()
+        best_fallback_position_error = float("inf")
+        best_fallback_task_cost = float("inf")
+
+        best_valid_q: np.ndarray | None = None
+        best_valid_joint_jump = float("inf")
+        best_valid_position_error = float("inf")
+
+        identity_6 = np.eye(6, dtype=np.float64)
+        random_generator = np.random.default_rng(seed=42)
 
         for seed in candidate_seeds:
             q = self._clip_to_joint_limits(seed.copy())
-            position_error_norm = float("inf")
 
-            for _ in range(max_iters):
-                frames = self.forward_kinematics_chain(q)
-                current_pose = frames[-1]
-                current_position = current_pose[:3, 3]
-                current_rotation = current_pose[:3, :3]
-                position_error = target_position - current_position
-                position_error_norm = float(np.linalg.norm(position_error))
+            (
+                frames,
+                position_error,
+                rotation_error,
+                position_error_norm,
+                rotation_error_norm,
+                task_cost,
+            ) = evaluate(q)
 
-                if self.orientation_mode == "yaw_only":
-                    yaw_cur = float(
-                        np.arctan2(
-                            current_rotation.item(1, 0),
-                            current_rotation.item(0, 0),
-                        )
-                    )
-                    yaw_tgt = float(
-                        np.arctan2(
-                            target_rotation.item(1, 0),
-                            target_rotation.item(0, 0),
-                        )
-                    )
-                    yaw_err = float(
-                        np.arctan2(
-                            np.sin(yaw_tgt - yaw_cur), np.cos(yaw_tgt - yaw_cur)
-                        )
-                    )
-                    orientation_error = np.array(
-                        [0.0, 0.0, yaw_err], dtype=np.float64
-                    )
+            damping = initial_damping
+            stagnation_count = 0
 
-                else:
-                    orientation_error = self._rotation_error(
-                        current_rotation, target_rotation
-                    )
-
-                orientation_error_norm = float(np.linalg.norm(orientation_error))
-
-                if position_error_norm < best_position_error:
-                    best_position_error = position_error_norm
-                    best_q = q.copy()
+            def record_solution(
+                candidate_joints: np.ndarray,
+                candidate_position_error: float,
+                candidate_rotation_error: float,
+                candidate_task_cost: float,
+            ) -> bool:
+                nonlocal best_valid_q
+                nonlocal best_valid_joint_jump
+                nonlocal best_valid_position_error
+                nonlocal best_fallback_q
+                nonlocal best_fallback_position_error
+                nonlocal best_fallback_task_cost
 
                 if (
-                    position_error_norm < pos_tol
-                    and orientation_error_norm < rot_tol
-                ):
-                    if validated_q_init is None:
-                        return True, q, position_error_norm
-
-                    joint_jump = self._normalized_joint_jump(
-                        q, validated_q_init
+                    candidate_position_error < best_fallback_position_error
+                    or (
+                        candidate_position_error == best_fallback_position_error
+                        and candidate_task_cost < best_fallback_task_cost
                     )
-                    if joint_jump < best_smooth_joint_jump:
-                        best_smooth_q = q.copy()
-                        best_smooth_joint_jump = joint_jump
-                        best_smooth_position_error = position_error_norm
+                ):
+                    best_fallback_q = candidate_joints.copy()
+                    best_fallback_position_error = candidate_position_error
+                    best_fallback_task_cost = candidate_task_cost
 
-                    # Early exit when a smooth continuous solution is already found
-                    if best_smooth_joint_jump <= max_allowed_joint_jump_deg:
-                        return True, best_smooth_q, best_smooth_position_error
+                position_ok = candidate_position_error < pos_tol
+                orientation_ok = candidate_rotation_error < rot_tol
 
-                w_diag = np.array([1.0, 1.0, 1.0, 50.0, 50.0, 50.0], dtype=np.float64)
-                weighted_error = w_diag * np.concatenate(
-                    [position_error, orientation_error]
+                if not (position_ok and orientation_ok):
+                    return False
+
+                if q_init is None:
+                    best_valid_q = candidate_joints.copy()
+                    best_valid_position_error = candidate_position_error
+                    return True
+
+                continuous_candidate = self._nearest_equivalent_configuration(
+                    candidate_joints,
+                    q_init,
                 )
-                jacobian = self.compute_jacobian_from_frames(frames)
-                weighted_jac = w_diag[:, None] * jacobian
+                joint_jump = self.joint_jump(
+                    continuous_candidate,
+                    q_init,
+                )
 
-                cond = float(np.linalg.cond(weighted_jac))
-                damping = 0.05 if cond > 1e4 else 0.01
-                lambda_sq = damping**2
+                if joint_jump < best_valid_joint_jump:
+                    best_valid_q = continuous_candidate.copy()
+                    best_valid_joint_jump = joint_jump
+                    best_valid_position_error = candidate_position_error
 
-                jjt = weighted_jac @ weighted_jac.T + lambda_sq * np.eye(6)
-                delta_q = weighted_jac.T @ np.linalg.solve(jjt, weighted_error)
+                if (
+                    max_joint_jump_deg is not None
+                    and joint_jump <= max_joint_jump_deg
+                ):
+                    return True
+
+                return False
 
 
-                # Scale full step vector in normalized units to preserve descent direction
-                scaled_dq = np.array(
+            if record_solution(
+                q,
+                position_error_norm,
+                rotation_error_norm,
+                task_cost,
+            ):
+                
+                assert best_valid_q is not None
+                return True, best_valid_q.copy(), best_valid_position_error
+
+
+            for _ in range(max_iters):
+                if (
+                    position_error_norm < pos_tol
+                    and rotation_error_norm < rot_tol
+                ):
+                    if q_init is None:
+                        return (
+                            True,
+                            q.copy(),
+                            position_error_norm,
+                        )
+
+                    break
+
+                weighted_error = np.concatenate(
                     [
-                        (delta_q[i] / 50.0)
-                        if self.dh_table[i].joint_type == "prismatic"
-                        else delta_q[i]
-                        for i in range(self.dof)
-                    ],
-                    dtype=np.float64,
+                        position_weight * position_error,
+                        orientation_weight * rotation_error,
+                    ]
                 )
-                step_norm = float(np.linalg.norm(scaled_dq))
-                max_step_norm = 0.35
+
+                jacobian = self.compute_jacobian_from_frames(
+                    frames
+                )
+
+                try:
+                    damped_matrix = (
+                        jacobian @ jacobian.T
+                        + damping**2 * identity_6
+                    )
+                    full_step = jacobian.T @ np.linalg.solve(
+                        damped_matrix,
+                        weighted_error,
+                    )
+                except np.linalg.LinAlgError:
+                    damping = min(
+                        maximum_damping,
+                        damping * 2.0,
+                    )
+                    continue
+
+                if not np.all(np.isfinite(full_step)):
+                    damping = min(
+                        maximum_damping,
+                        damping * 2.0,
+                    )
+                    continue
+
+                step_norm = float(np.linalg.norm(full_step))
+
                 if step_norm > max_step_norm:
-                    delta_q *= max_step_norm / step_norm
+                    full_step *= max_step_norm / step_norm
 
-                q = self._clip_to_joint_limits(q + delta_q)
+                accepted = False
 
-        if best_smooth_q is not None:
-            return True, best_smooth_q, best_smooth_position_error
+                for step_scale in (1.0, 0.5, 0.25, 0.1):
+                    candidate_q = self._clip_to_joint_limits(
+                        q + step_scale * full_step
+                    )
 
-        return best_position_error <= pos_tol, best_q, best_position_error
+                    (
+                        candidate_frames,
+                        candidate_position_error,
+                        candidate_rotation_error,
+                        candidate_position_error_norm,
+                        candidate_rotation_error_norm,
+                        candidate_task_cost,
+                    ) = evaluate(candidate_q)
 
-    def _normalized_joint_jump(
-        self, q_new: np.ndarray, q_old: np.ndarray
-    ) -> float:
-        """Computes max joint jump in equivalent degrees using configurable prismatic scaling."""
-        max_jump_deg = 0.0
-        for idx, param in enumerate(self.dh_table):
-            diff = abs(float(q_new[idx]) - float(q_old[idx]))
-            if param.joint_type == "prismatic":
-                jump_deg = diff / max(1e-6, self.prismatic_mm_per_equiv_deg)
-            else:
-                jump_deg = float(np.rad2deg(diff))
-            max_jump_deg = max(max_jump_deg, jump_deg)
-        return max_jump_deg
+                    if candidate_task_cost < task_cost:
+                        q = candidate_q
+                        frames = candidate_frames
+                        position_error = candidate_position_error
+                        rotation_error = candidate_rotation_error
+                        position_error_norm = (
+                            candidate_position_error_norm
+                        )
+                        rotation_error_norm = (
+                            candidate_rotation_error_norm
+                        )
+                        task_cost = candidate_task_cost
+
+                        damping = max(
+                            minimum_damping,
+                            damping * 0.5,
+                        )
+                        stagnation_count = 0
+                        accepted = True
+
+                        if record_solution(
+                            q,
+                            position_error_norm,
+                            rotation_error_norm,
+                            task_cost,
+                        ):
+                            
+                            assert best_valid_q is not None
+                            return True, best_valid_q.copy(), best_valid_position_error
+
+                        break
+
+                if not accepted:
+                    damping = min(
+                        maximum_damping,
+                        damping * 2.0,
+                    )
+                    stagnation_count += 1
+
+                    if (
+                        damping >= maximum_damping
+                        and stagnation_count >= 5
+                    ):
+                        perturbation = random_generator.normal(
+                            0.0,
+                            0.01,
+                            size=self.dof,
+                        )
+                        q = self._clip_to_joint_limits(
+                            q + perturbation
+                        )
+
+                        (
+                            frames,
+                            position_error,
+                            rotation_error,
+                            position_error_norm,
+                            rotation_error_norm,
+                            task_cost,
+                        ) = evaluate(q)
+
+                        damping = initial_damping
+                        stagnation_count = 0
+
+                        if record_solution(
+                            q,
+                            position_error_norm,
+                            rotation_error_norm,
+                            task_cost,
+                        ):
+                            
+                            return (
+                                True,
+                                q.copy(),
+                                position_error_norm,
+                            )
+
+        if best_valid_q is not None:
+            return (
+                True,
+                best_valid_q.copy(),
+                best_valid_position_error,
+            )
+
+        return (
+            False,
+            best_fallback_q.copy(),
+            best_fallback_position_error,
+        )
     
-    def joint_jump(self, q_new: np.ndarray, q_old: np.ndarray) -> float:
-        """Public wrapper returning max joint-space jump in equivalent degrees."""
-        return self._normalized_joint_jump(q_new, q_old)
+    @staticmethod
+    def _normalize_angle_difference(
+        angle_difference: float,
+    ) -> float:
+        """Wraps an angular difference into [-pi, pi]."""
+        return (angle_difference + np.pi) % (2.0 * np.pi) - np.pi
+    
+    def _nearest_equivalent_configuration(
+        self,
+        q_candidate: np.ndarray,
+        q_reference: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Shifts revolute joints by whole turns to the equivalent configuration
+        nearest to q_reference, while respecting configured joint limits.
+        """
+        q_candidate = self._validate_joint_vector(q_candidate)
+        q_reference = self._validate_joint_vector(q_reference)
 
+        adjusted = q_candidate.copy()
+
+        for index, parameter in enumerate(self.dh_table):
+            if parameter.joint_type != "revolute":
+                continue
+
+            lower, upper = self.joint_limits[index]
+            raw_difference = float(q_candidate[index] - q_reference[index])
+            wrapped_difference = self._normalize_angle_difference(raw_difference)
+            nearest_candidate = float(q_reference[index]) + wrapped_difference
+
+            if lower <= nearest_candidate <= upper:
+                adjusted[index] = nearest_candidate
+
+        return self._clip_to_joint_limits(adjusted)
 
 
 SUPPORTED_ROBOTS: dict[str, str] = {
-    "industrial_6dof": "6-DoF Industrial Welding Arm with Spherical Wrist (KUKA/Mitsubishi style)",
-    "cobot_6dof": "6-DoF Collaborative Welding Arm with Synthetic Offset Wrist (UR-inspired)",
-    "scara_4dof": "4-DoF SCARA Vertical Spot-Welding Robot (R-R-P-R kinematic chain)",
+    "industrial_6dof": (
+        "6-DoF industrial welding arm with spherical wrist "
+        "(KUKA/Mitsubishi-style kinematic profile)."
+    ),
+    "cobot_6dof": (
+        "6-DoF collaborative welding arm with offset wrist "
+        "(UR5/UR10-inspired synthetic kinematic profile)."
+    ),
+    "scara_4dof": (
+        "4-DoF SCARA vertical spot-welding robot "
+        "(R-R-P-R kinematic chain)."
+    ),
 }
 
 
-def create_manipulator(robot_type: str = "industrial_6dof") -> RobotManipulator:
-    """Factory creating configured kinematic models for supported industrial robots."""
+def create_manipulator(
+    robot_type: str = "industrial_6dof",
+) -> RobotManipulator:
+    """Creates a configured kinematic model for a supported robot type."""
     key = robot_type.strip().lower()
 
     if key == "industrial_6dof":
@@ -393,30 +943,35 @@ def create_manipulator(robot_type: str = "industrial_6dof") -> RobotManipulator:
             description=SUPPORTED_ROBOTS["industrial_6dof"],
             dh_table=[
                 DHParameter(a=150.0, alpha=-np.pi / 2, d=400.0),
-                DHParameter(a=550.0, alpha=0.0, d=0.0, theta_offset=-np.pi / 2),
+                DHParameter(
+                    a=550.0,
+                    alpha=0.0,
+                    d=0.0,
+                    theta_offset=-np.pi / 2,
+                ),
                 DHParameter(a=120.0, alpha=-np.pi / 2, d=0.0),
                 DHParameter(a=0.0, alpha=np.pi / 2, d=500.0),
                 DHParameter(a=0.0, alpha=-np.pi / 2, d=0.0),
                 DHParameter(a=0.0, alpha=0.0, d=120.0),
             ],
             joint_limits=[
-                (-np.deg2rad(170), np.deg2rad(170)),
-                (-np.deg2rad(135), np.deg2rad(135)),
-                (-np.deg2rad(150), np.deg2rad(160)),
-                (-np.deg2rad(185), np.deg2rad(185)),
-                (-np.deg2rad(135), np.deg2rad(135)),
-                (-np.deg2rad(350), np.deg2rad(350)),
+                (-np.deg2rad(170.0), np.deg2rad(170.0)),
+                (-np.deg2rad(135.0), np.deg2rad(135.0)),
+                (-np.deg2rad(150.0), np.deg2rad(160.0)),
+                (-np.deg2rad(185.0), np.deg2rad(185.0)),
+                (-np.deg2rad(135.0), np.deg2rad(135.0)),
+                (-np.deg2rad(350.0), np.deg2rad(350.0)),
             ],
             seeds=[
                 np.zeros(6, dtype=np.float64),
-                np.array([0.0, 0.2, 0.5, 0.0, 0.8, 0.0], dtype=np.float64),
-                np.array([0.0, -0.3, 0.8, 0.0, 0.9, 0.0], dtype=np.float64),
+                np.array([0.0, 0.2, 0.5, 0.0, 0.8, 0.0]),
+                np.array([0.0, -0.3, 0.8, 0.0, 0.9, 0.0]),
             ],
             max_reach_mm=1350.0,
+            tool_z_points_into_workpiece=True,
         )
 
     if key == "cobot_6dof":
-        # Synthetic non-spherical offset wrist geometry (reach ~1150 mm)
         return RobotManipulator(
             robot_type="cobot_6dof",
             description=SUPPORTED_ROBOTS["cobot_6dof"],
@@ -429,48 +984,73 @@ def create_manipulator(robot_type: str = "industrial_6dof") -> RobotManipulator:
                 DHParameter(a=0.0, alpha=0.0, d=110.0),
             ],
             joint_limits=[
-                (-np.pi, np.pi),
-                (-np.pi, np.pi),
-                (-np.deg2rad(165), np.deg2rad(165)),
-                (-np.pi, np.pi),
-                (-np.pi, np.pi),
+                (-2.0 * np.pi, 2.0 * np.pi),
+                (-2.0 * np.pi, 2.0 * np.pi),
+                (-np.deg2rad(165.0), np.deg2rad(165.0)),
+                (-2.0 * np.pi, 2.0 * np.pi),
+                (-2.0 * np.pi, 2.0 * np.pi),
                 (-2.0 * np.pi, 2.0 * np.pi),
             ],
             seeds=[
-                np.array([2.9, -2.1, 1.5, -1.0, -1.57, 0.0], dtype=np.float64),
-                np.array([-2.9, -2.1, 1.5, -1.0, -1.57, 0.0], dtype=np.float64),
-                np.array([3.14, -1.8, 1.2, -1.0, -1.57, 0.0], dtype=np.float64),
+                np.array([2.9, -2.1, 1.5, -1.0, -1.57, 0.0]),
+                np.array([-2.9, -2.1, 1.5, -1.0, -1.57, 0.0]),
+                np.array([3.14, -1.8, 1.2, -1.0, -1.57, 0.0]),
             ],
             max_reach_mm=1200.0,
+            tool_z_points_into_workpiece=True,
         )
 
     if key == "scara_4dof":
-        # 4-DoF R-R-P-R SCARA: horizontal reach 450 + 400 = 850 mm, vertical Z quill [0..350 mm]
         return RobotManipulator(
             robot_type="scara_4dof",
             description=SUPPORTED_ROBOTS["scara_4dof"],
             dh_table=[
-                DHParameter(a=450.0, alpha=0.0, d=520.0, joint_type="revolute"),
-                DHParameter(a=400.0, alpha=np.pi, d=0.0, joint_type="revolute"),
-                DHParameter(a=0.0, alpha=0.0, d=0.0, joint_type="prismatic"),
-                DHParameter(a=0.0, alpha=0.0, d=60.0, joint_type="revolute"),
+                DHParameter(
+                    a=450.0,
+                    alpha=0.0,
+                    d=520.0,
+                    joint_type="revolute",
+                ),
+                DHParameter(
+                    a=400.0,
+                    alpha=np.pi,
+                    d=0.0,
+                    joint_type="revolute",
+                ),
+                DHParameter(
+                    a=0.0,
+                    alpha=0.0,
+                    d=0.0,
+                    joint_type="prismatic",
+                ),
+                DHParameter(
+                    a=0.0,
+                    alpha=0.0,
+                    d=60.0,
+                    joint_type="revolute",
+                ),
             ],
             joint_limits=[
-                (-np.deg2rad(150), np.deg2rad(150)),
-                (-np.deg2rad(145), np.deg2rad(145)),
-                (0.0, 350.0),  # Prismatic vertical stroke in mm (downward along flipped Z)
+                (-np.deg2rad(150.0), np.deg2rad(150.0)),
+                (-np.deg2rad(145.0), np.deg2rad(145.0)),
+                (0.0, 350.0),
                 (-np.pi, np.pi),
             ],
             seeds=[
-                np.array([0.4, -0.8, 100.0, 0.0], dtype=np.float64),
-                np.array([-0.4, 0.8, 100.0, 0.0], dtype=np.float64),
+                np.array([0.4, -0.8, 100.0, 0.0]),
+                np.array([-0.4, 0.8, 100.0, 0.0]),
             ],
             max_reach_mm=1100.0,
-            orientation_mode="yaw_only",
+            position_only_orientation=True,
+            # The current DH chain leaves the tool Z axis along base +Z.
+            # Set False unless a tool/flange rotation makes the actual TCP
+            # Z axis point downward.
+            tool_z_points_into_workpiece=False,
         )
 
     raise ValueError(
-        f"Unknown robot_type '{robot_type}'. Supported models: {sorted(SUPPORTED_ROBOTS.keys())}."
+        f"Unknown robot_type '{robot_type}'. Supported models: "
+        f"{sorted(SUPPORTED_ROBOTS.keys())}."
     )
 
 
@@ -479,6 +1059,7 @@ class SixDofArm(RobotManipulator):
 
     def __init__(self) -> None:
         default_arm = create_manipulator("industrial_6dof")
+
         super().__init__(
             robot_type=default_arm.robot_type,
             description=default_arm.description,
@@ -486,4 +1067,23 @@ class SixDofArm(RobotManipulator):
             joint_limits=default_arm.joint_limits,
             seeds=default_arm.seeds,
             max_reach_mm=default_arm.max_reach_mm,
+            tool_z_points_into_workpiece=(
+                default_arm.tool_z_points_into_workpiece
+            ),
         )
+
+
+def _as_vector3(value: object, field_name: str) -> np.ndarray:
+    vector = np.asarray(value, dtype=np.float64)
+
+    if vector.shape != (3,):
+        raise ValueError(
+            f"{field_name} must contain exactly three coordinates."
+        )
+
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(
+            f"{field_name} must contain only finite values."
+        )
+
+    return vector

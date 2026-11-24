@@ -166,3 +166,15 @@ def test_waypoint_arrays_are_immutable():
     waypoint = _make_waypoint()
     with pytest.raises(ValueError):
         waypoint.xyz_mm[:] = 999.0
+
+
+def test_movj_rejects_tcp_speed():
+    with pytest.raises(ValueError):
+        TrajectoryWaypoint(
+            label="BAD_MOVJ",
+            move_type="MOVJ",
+            xyz_mm=np.array([100.0, 200.0, 300.0]),
+            joints_deg=np.zeros(6),
+            orientation=np.eye(3),
+            tcp_speed_mm_s=25.0,
+        )

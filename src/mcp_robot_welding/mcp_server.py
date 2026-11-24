@@ -1,115 +1,221 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import logging
 import re
 import uuid
+from dataclasses import dataclass
+
 import numpy as np
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from .kinematics import SUPPORTED_ROBOTS, create_manipulator
-from .postprocessor import TrajectoryWaypoint, compile_program
 from .scene import WorkpieceScene
+from .postprocessor import (
+    PostprocessorConfig,
+    TrajectoryWaypoint,
+    compile_program,
+)
 
-logger = logging.getLogger("mcp_robot_welding.server")
+
+WELDING_POSTPROCESSOR_CONFIG = PostprocessorConfig(
+    override_percent=100.0,
+    melfa_arc_start_cmd="ArcStart 1",
+    melfa_arc_end_cmd="ArcEnd 1",
+    melfa_arc_start_delay_s=0.0,
+    melfa_arc_end_delay_s=0.0,
+    gcode_arc_start_cmd="M62 P1",
+    gcode_arc_end_cmd="M64 P1",
+)
+
+HOME_JOINT_SPEED_PERCENT = 40.0
+APPROACH_JOINT_SPEED_PERCENT = 40.0
+
+logger = logging.getLogger("mcp_robot_welding.mcp_server")
+
 
 mcp = MCPServer("Industrial-Robot-Welding-Simulator")
 
 scene = WorkpieceScene()
 
 SUPPORTED_PROGRAM_DIALECTS = {"melfa", "gcode"}
-MAX_WAYPOINT_JOINT_JUMP_DEGREES = 120.0
-MAX_SAMPLE_JOINT_JUMP_DEGREES = 25.0
-WELD_PATH_COLLISION_SAMPLES = 20
-MOVJ_COLLISION_SAMPLES = 15
-MAX_WELD_SPEED_MM_S = 250.0
-MAX_APPROACH_CLEARANCE_MM = 300.0
-DEFAULT_TRANSIT_JOINT_SPEED_PERCENT = 50.0
-DEFAULT_APPROACH_JOINT_SPEED_PERCENT = 40.0
-PROGRAM_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+MAX_JOINT_JUMP_DEGREES = 15.0
+MAX_MOVJ_JOINT_JUMP_DEGREES = 120.0
+MAX_MOVL_WAYPOINT_JUMP_DEGREES = 45.0
+MAX_WELD_SAMPLE_JOINT_JUMP_DEGREES = 25.0
+WELD_PATH_COLLISION_SAMPLES = 25
+MOVJ_COLLISION_SAMPLES = 25
+MAX_WELD_SPEED_MM_S = 100.0
+MAX_APPROACH_CLEARANCE_MM = 250.0
+MAX_STORED_PLANS = 20
 
 
 @dataclass(frozen=True)
-class ValidatedPlanRecord:
+class ValidatedPlan:
     plan_id: str
     robot_type: str
-    dof: int
-    seams_planned: list[str]
-    waypoints: tuple[TrajectoryWaypoint, ...]
+    waypoints: list[TrajectoryWaypoint]
 
 
-# Thread/request-safe registry keyed by plan_id (with latest_plan_id fallback for single-agent CLI)
-validated_plans: dict[str, ValidatedPlanRecord] = {}
-latest_plan_id: str | None = None
+validated_plans: dict[str, ValidatedPlan] = {}
+
+
+def _store_plan(plan: ValidatedPlan) -> None:
+    validated_plans[plan.plan_id] = plan
+
+    while len(validated_plans) > MAX_STORED_PLANS:
+        oldest_plan_id = next(iter(validated_plans))
+        validated_plans.pop(oldest_plan_id, None)
+
+
+def _get_plan(plan_id: str) -> ValidatedPlan:
+    plan = validated_plans.get(plan_id)
+
+    if plan is None:
+        raise ToolError(
+            f"Unknown or expired plan_id '{plan_id}'. "
+            "Call plan_and_simulate_weld first."
+        )
+
+    return plan
 
 
 @mcp.resource("scene://workpiece/seams")
 def get_workpiece_seams_resource() -> str:
     """Provides CAD workpiece metadata and available weld seams as JSON."""
-    payload = {
-        "part_name": scene.part_name,
-        "seams": [seam.model_dump() for seam in scene.seams.values()],
-    }
-    return json.dumps(payload, indent=2)
+    return json.dumps(
+        scene.get_workpiece_metadata(),
+        indent=2,
+    )
 
 
 @mcp.tool()
 def list_supported_robots() -> dict:
     """Lists available manipulator kinematic models and their degrees of freedom."""
     models = []
-    for r_type, desc in SUPPORTED_ROBOTS.items():
-        manipulator = create_manipulator(r_type)
+
+    for robot_type, description in SUPPORTED_ROBOTS.items():
+        manipulator = create_manipulator(robot_type)
+
         models.append(
             {
-                "robot_type": r_type,
+                "robot_type": robot_type,
                 "dof": manipulator.dof,
                 "max_reach_mm": manipulator.max_reach_mm,
-                "description": desc,
+                "tool_z_points_into_workpiece": (
+                    manipulator.tool_z_points_into_workpiece
+                ),
+                "description": description,
             }
         )
+
     return {"supported_robots": models}
 
 
 @mcp.tool()
 def inspect_workpiece() -> dict:
-    """Returns the loaded 3D workpiece name, bounding obstacles, and available weld seam IDs."""
+    """Returns workpiece metadata, obstacles, and available weld seam IDs."""
+    metadata = scene.get_workpiece_metadata()
+
     return {
-        "part_name": scene.part_name,
+        "part_name": metadata["part_name"],
         "available_seams": [
             {
-                "seam_id": seam.seam_id,
-                "description": seam.description,
-                "start_xyz": seam.start_xyz,
-                "end_xyz": seam.end_xyz,
+                "seam_id": seam["seam_id"],
+                "description": seam["description"],
+                "start_xyz": seam["start_xyz"],
+                "end_xyz": seam["end_xyz"],
+                "normal_xyz": seam["normal_xyz"],
+                "weld_type": seam["weld_type"],
+                "length_mm": (
+                    scene.seams[seam["seam_id"]].length_mm
+                ),
             }
-            for seam in scene.seams.values()
+            for seam in metadata["seams"]
         ],
     }
 
 
-def _check_joint_space_segment_collisions(
-    arm,
-    q_start: np.ndarray,
-    q_end: np.ndarray,
-    segment_label: str,
+def _validate_planning_arguments(
+    seam_ids: list[str],
+    weld_speed_mm_s: float,
+    approach_clearance_mm: float,
+) -> None:
+    if not seam_ids:
+        raise ToolError("At least one seam_id is required.")
+
+    if len(seam_ids) != len(set(seam_ids)):
+        raise ToolError("seam_ids must not contain duplicates.")
+
+    if not np.isfinite(weld_speed_mm_s) or weld_speed_mm_s <= 0.0:
+        raise ToolError("weld_speed_mm_s must be a positive finite number.")
+
+    if weld_speed_mm_s > MAX_WELD_SPEED_MM_S:
+        raise ToolError(
+            f"weld_speed_mm_s must not exceed {MAX_WELD_SPEED_MM_S:.1f} mm/s."
+        )
+
+    if not np.isfinite(approach_clearance_mm) or approach_clearance_mm < 0.0:
+        raise ToolError(
+            "approach_clearance_mm must be a non-negative finite number."
+        )
+
+    if approach_clearance_mm > MAX_APPROACH_CLEARANCE_MM:
+        raise ToolError(
+            "approach_clearance_mm must not exceed "
+            f"{MAX_APPROACH_CLEARANCE_MM:.1f} mm."
+        )
+
+
+def _validate_seam_ids(seam_ids: list[str]) -> None:
+    unknown_seams = [
+        seam_id for seam_id in seam_ids if seam_id not in scene.seams
+    ]
+
+    if unknown_seams:
+        raise ToolError(
+            f"Unknown seam_id(s): {unknown_seams}. Available seam IDs: "
+            f"{list(scene.seams.keys())}."
+        )
+
+
+def _ik_failure_response(
     robot_type: str,
-    samples: int = MOVJ_COLLISION_SAMPLES,
-) -> dict | None:
-    """Interpolates joint configurations for MOVJ segments and checks every intermediate pose."""
-    for idx, alpha in enumerate(np.linspace(0.0, 1.0, samples)):
-        q_interp = (1.0 - alpha) * q_start + alpha * q_end
-        frames = arm.forward_kinematics_chain(q_interp)
-        collision, msg = scene.check_chain_collision(frames)
-        if collision:
-            return {
-                "status": "COLLISION_DETECTED",
-                "robot_type": robot_type,
-                "waypoint": f"{segment_label}_MOVJ_SAMPLE_{idx}",
-                "details": msg,
-                "partial_plan_retained": False,
-            }
-    return None
+    waypoint: str,
+    target_xyz: np.ndarray,
+    position_error: float,
+) -> dict:
+    return {
+        "status": "IK_UNREACHABLE",
+        "robot_type": robot_type,
+        "waypoint": waypoint,
+        "target_xyz": np.round(target_xyz, 3).tolist(),
+        "position_error_mm": round(float(position_error), 3),
+        "details": (
+            "IK did not reach the requested position/orientation tolerance. "
+            "The target may be outside the reachable workspace, blocked by "
+            "joint limits, or require a different tool orientation."
+        ),
+    }
+
+
+def _collision_failure_response(
+    robot_type: str,
+    waypoint: str,
+    collision_message: str,
+    obstacle_name: str | None,
+    link_name: str | None,
+) -> dict:
+    return {
+        "status": "COLLISION_DETECTED",
+        "robot_type": robot_type,
+        "waypoint": waypoint,
+        "details": collision_message,
+        "obstacle": obstacle_name,
+        "link": link_name,
+    }
 
 
 @mcp.tool()
@@ -118,505 +224,508 @@ def plan_and_simulate_weld(
     weld_speed_mm_s: float = 25.0,
     approach_clearance_mm: float = 40.0,
     robot_type: str = "industrial_6dof",
-    tool_z_points_into_workpiece: bool = True,
 ) -> dict:
     """
-    Plans approach, linear weld, and retract trajectories for requested seams
-    with full continuous MOVJ/MOVL collision checking and branch-continuous IK.
+    Plans approach, weld, retract, and return-home trajectories for seams.
 
-    Convention: when tool_z_points_into_workpiece=True, tool +Z aligns with -seam_normal.
+    The result is a kinematically and statically collision-checked simulation.
+    It is not a production-ready robot program until the robot mounting, tool
+    geometry, controller postprocessor, and welding-interface mapping have
+    been validated.
     """
-    global latest_plan_id
+    _validate_planning_arguments(
+        seam_ids,
+        weld_speed_mm_s,
+        approach_clearance_mm,
+    )
+    _validate_seam_ids(seam_ids)
 
     try:
-        if not seam_ids:
-            return {
-                "status": "ERROR",
-                "reason": "At least one seam_id is required.",
-                "partial_plan_retained": False,
-            }
-        if len(set(seam_ids)) != len(seam_ids):
-            return {
-                "status": "ERROR",
-                "reason": "Duplicate seam_ids detected. Each seam must be requested once.",
-                "partial_plan_retained": False,
-            }
-        if not (0.0 < weld_speed_mm_s <= MAX_WELD_SPEED_MM_S):
-            return {
-                "status": "ERROR",
-                "reason": f"weld_speed_mm_s must be in (0, {MAX_WELD_SPEED_MM_S}] mm/s.",
-                "partial_plan_retained": False,
-            }
-        if not (0.0 <= approach_clearance_mm <= MAX_APPROACH_CLEARANCE_MM):
-            return {
-                "status": "ERROR",
-                "reason": f"approach_clearance_mm must be in [0, {MAX_APPROACH_CLEARANCE_MM}] mm.",
-                "partial_plan_retained": False,
-            }
+        arm = create_manipulator(robot_type)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
 
-        try:
-            arm = create_manipulator(robot_type)
-        except ValueError as exc:
-            return {
-                "status": "ERROR",
-                "reason": str(exc),
-                "partial_plan_retained": False,
-            }
+    planned_waypoints: list[TrajectoryWaypoint] = []
+    home_xyz = np.array([450.0, 0.0, 420.0], dtype=np.float64)
+    home_tool_orientation = arm.default_tool_orientation()
+    safe_transit_z = 430.0 if arm.position_only_orientation else 650.0
+    safe_transit_xyz = np.array([450.0, 0.0, safe_transit_z], dtype=np.float64)
 
-        planned_waypoints: list[TrajectoryWaypoint] = []
-        home_xyz = np.array([450.0, 0.0, 420.0], dtype=np.float64)
-        home_tool_z = np.array([0.0, 0.0, -1.0], dtype=np.float64)
-        home_tool_orientation = arm.make_tool_orientation(home_tool_z)
 
-        home_ik_success, q_home, home_err = arm.inverse_kinematics(
-            target_pos=home_xyz,
+    def _append_safe_transit(
+        q_prev: np.ndarray,
+        transit_label: str,
+    ) -> tuple[np.ndarray, list[np.ndarray]] | None:
+        ik_ok, q_transit, _ = arm.inverse_kinematics(
+            target_pos=safe_transit_xyz,
             target_rot=home_tool_orientation,
+            q_init=q_prev,
+            max_joint_jump_deg=MAX_MOVJ_JOINT_JUMP_DEGREES,
         )
-        if not home_ik_success:
-            return {
-                "status": "IK_UNREACHABLE",
-                "robot_type": arm.robot_type,
-                "waypoint": "HOME_SAFE",
-                "target_xyz": home_xyz.tolist(),
-                "target_tool_z": home_tool_z.tolist(),
-                "position_error_mm": round(home_err, 3),
-                "exceeded_coarse_reach": bool(np.linalg.norm(home_xyz) > arm.max_reach_mm),
-                "partial_plan_retained": False,
-            }
+        if not ik_ok:
+            return None
+
+        transit_frames = arm.forward_kinematics_chain(q_transit)
+        if scene.check_chain_collision(transit_frames, allow_tool_contact=False).collided:
+            return None
+
+        if _check_movj_collision(
+            arm=arm,
+            q_start=q_prev,
+            q_end=q_transit,
+            waypoint_label=transit_label,
+            robot_type=arm.robot_type,
+        ) is not None:
+            return None
 
         planned_waypoints.append(
             TrajectoryWaypoint(
-                label="HOME_SAFE",
+                label=transit_label,
                 move_type="MOVJ",
-                xyz_mm=home_xyz,
-                joints_deg=np.rad2deg(q_home),
+                xyz_mm=safe_transit_xyz,
+                joints_deg=np.rad2deg(q_transit),
                 orientation=home_tool_orientation,
-                joint_speed_percent=DEFAULT_TRANSIT_JOINT_SPEED_PERCENT,
+                joint_speed_percent=HOME_JOINT_SPEED_PERCENT,
             )
         )
-        q_current = q_home.copy()
+        return q_transit.copy(), transit_frames
 
-        for seam_idx, seam_id in enumerate(seam_ids):
-            if seam_id not in scene.seams:
-                return {
-                    "status": "ERROR",
-                    "reason": (
-                        f"Unknown seam_id '{seam_id}'. "
-                        f"Available seam IDs: {list(scene.seams.keys())}."
-                    ),
-                    "partial_plan_retained": False,
-                }
 
-            # Safe overhead clearance transit between consecutive seams on different faces
-            if seam_idx > 0:
-                transit_coll = _check_joint_space_segment_collisions(
-                    arm=arm,
-                    q_start=q_current,
-                    q_end=q_home,
-                    segment_label=f"{seam_id}_SAFE_TRANSIT",
-                    robot_type=arm.robot_type,
-                )
-                if transit_coll is not None:
-                    return transit_coll
+    home_ik_success, q_home, home_position_error = arm.inverse_kinematics(
+        target_pos=home_xyz,
+        target_rot=home_tool_orientation,
+    )
 
-                planned_waypoints.append(
-                    TrajectoryWaypoint(
-                        label=f"{seam_id}_SAFE_TRANSIT",
-                        move_type="MOVJ",
-                        xyz_mm=home_xyz,
-                        joints_deg=np.rad2deg(q_home),
-                        orientation=home_tool_orientation,
-                        joint_speed_percent=DEFAULT_TRANSIT_JOINT_SPEED_PERCENT,
-                    )
-                )
-                q_current = q_home.copy()
+    if not home_ik_success:
+        return _ik_failure_response(
+            robot_type=arm.robot_type,
+            waypoint="HOME_SAFE",
+            target_xyz=home_xyz,
+            position_error=home_position_error,
+        )
 
-            seam = scene.seams[seam_id]
-            seam_start = np.asarray(seam.start_xyz, dtype=np.float64)
-            seam_end = np.asarray(seam.end_xyz, dtype=np.float64)
-            seam_length = float(np.linalg.norm(seam_end - seam_start))
-            if seam_length < 1e-6:
-                return {
-                    "status": "ERROR",
-                    "reason": f"Seam '{seam_id}' has zero length (start_xyz == end_xyz).",
-                    "partial_plan_retained": False,
-                }
+    planned_waypoints.append(
+        TrajectoryWaypoint(
+            label="HOME_SAFE",
+            move_type="MOVJ",
+            xyz_mm=home_xyz,
+            joints_deg=np.rad2deg(q_home),
+            orientation=home_tool_orientation,
+            joint_speed_percent=APPROACH_JOINT_SPEED_PERCENT,
+        )
+    )
 
-            raw_normal = np.asarray(seam.normal_xyz, dtype=np.float64)
-            normal_length = float(np.linalg.norm(raw_normal))
-            if normal_length < 1e-9:
-                return {
-                    "status": "ERROR",
-                    "reason": f"Seam '{seam_id}' has an invalid zero-length normal.",
-                    "partial_plan_retained": False,
-                }
-            seam_normal = raw_normal / normal_length
-
-            approach_xyz = seam_start + seam_normal * approach_clearance_mm
-            retract_xyz = seam_end + seam_normal * approach_clearance_mm
-            target_tool_z = -seam_normal if tool_z_points_into_workpiece else seam_normal
-            tool_orientation = arm.make_tool_orientation(target_tool_z)
-
-            # 1. Solve and continuously check MOVJ approach segment (q_current -> q_approach)
-            ok_app, q_approach, err_app = arm.inverse_kinematics(
-                target_pos=approach_xyz,
-                target_rot=tool_orientation,
-                q_init=q_current,
+    q_previous = q_home.copy()
+    home_frames = arm.forward_kinematics_chain(q_home)
+    previous_frames = home_frames
+    
+    for seam_idx, seam_id in enumerate(seam_ids):
+        if seam_idx > 0:
+            transit_err = _check_movj_collision(
+                arm=arm,
+                q_start=q_previous,
+                q_end=q_home,
+                waypoint_label=f"{seam_id}_SAFE_TRANSIT",
+                robot_type=arm.robot_type,
             )
-            if not ok_app:
-                return {
-                    "status": "IK_UNREACHABLE",
-                    "robot_type": arm.robot_type,
-                    "waypoint": f"{seam_id}_APPROACH",
-                    "target_xyz": approach_xyz.tolist(),
-                    "target_tool_z": target_tool_z.tolist(),
-                    "position_error_mm": round(err_app, 3),
-                                    "exceeded_coarse_reach": bool(np.linalg.norm(approach_xyz) > arm.max_reach_mm),
-                "partial_plan_retained": False,
-            }
+            if transit_err is not None:
+                return transit_err
+            
+            planned_waypoints.append(
+                TrajectoryWaypoint(
+                    label=f"{seam_id}_SAFE_TRANSIT",
+                    move_type="MOVJ",
+                    xyz_mm=home_xyz,
+                    joints_deg=np.rad2deg(q_home),
+                    orientation=home_tool_orientation,
+                    joint_speed_percent=HOME_JOINT_SPEED_PERCENT,
+                )
+            )
+            previous_frames = home_frames
+            q_previous = q_home.copy()
 
-            if arm.joint_jump(q_approach, q_current) > MAX_WAYPOINT_JOINT_JUMP_DEGREES:
+        seam = scene.seams[seam_id]
+        seam_start = seam.start
+        seam_end = seam.end
+        seam_normal = seam.normal
+
+        approach_xyz = seam_start + seam_normal * approach_clearance_mm
+        retract_xyz = seam_end + seam_normal * approach_clearance_mm
+
+        if arm.tool_z_points_into_workpiece:
+            tool_z_direction = -seam_normal
+        else:
+            tool_z_direction = seam_normal
+
+        current_tool_x = previous_frames[-1][:3, 0]
+        tool_orientation = arm.make_tool_orientation(
+            tool_z_direction,
+            reference_x_axis=current_tool_x,
+        )
+        weld_path_samples = seam.path_points(WELD_PATH_COLLISION_SAMPLES)
+
+        weld_steps = [
+            (
+                f"{seam_id}_APPROACH",
+                "MOVJ",
+                approach_xyz,
+                None,
+                120.0,
+            ),
+            (
+                f"{seam_id}_START",
+                "MOVL",
+                seam_start,
+                "ARC_ON",
+                weld_speed_mm_s,
+            ),
+            (
+                f"{seam_id}_MID",
+                "MOVL",
+                0.5 * (seam_start + seam_end),
+                None,
+                weld_speed_mm_s,
+            ),
+            (
+                f"{seam_id}_END",
+                "MOVL",
+                seam_end,
+                "ARC_OFF",
+                weld_speed_mm_s,
+            ),
+            (
+                f"{seam_id}_RETRACT",
+                "MOVJ",
+                retract_xyz,
+                None,
+                120.0,
+            ),
+        ]
+
+        for waypoint_label, move_type, target_xyz, arc_command, speed in weld_steps:
+            allowed_jump_deg = (
+                MAX_MOVJ_JOINT_JUMP_DEGREES
+                if move_type == "MOVJ"
+                else MAX_MOVL_WAYPOINT_JUMP_DEGREES
+            )
+
+            
+            ik_success, q_solution, position_error = arm.inverse_kinematics(
+                target_pos=target_xyz,
+                target_rot=tool_orientation,
+                q_init=q_previous,
+                max_joint_jump_deg=allowed_jump_deg,
+            )
+
+            if not ik_success:
+                return _ik_failure_response(
+                    robot_type=arm.robot_type,
+                    waypoint=waypoint_label,
+                    target_xyz=target_xyz,
+                    position_error=position_error,
+                )
+
+            joint_jump_deg = arm.joint_jump(q_solution, q_previous)
+
+            if joint_jump_deg > allowed_jump_deg:
                 return {
                     "status": "JOINT_DISCONTINUITY",
                     "robot_type": arm.robot_type,
-                    "waypoint": f"{seam_id}_APPROACH",
-                    "details": f"Jump {arm.joint_jump(q_approach, q_current):.1f} deg exceeds limit.",
-                    "partial_plan_retained": False,
-                }
-
-            movj_err = _check_joint_space_segment_collisions(
-                arm=arm,
-                q_start=q_current,
-                q_end=q_approach,
-                segment_label=f"{seam_id}_TO_APPROACH",
-                robot_type=arm.robot_type,
-            )
-            if movj_err is not None:
-                return movj_err
-
-            planned_waypoints.append(
-                TrajectoryWaypoint(
-                    label=f"{seam_id}_APPROACH",
-                    move_type="MOVJ",
-                    xyz_mm=approach_xyz,
-                    joints_deg=np.rad2deg(q_approach),
-                    orientation=tool_orientation,
-                    joint_speed_percent=DEFAULT_APPROACH_JOINT_SPEED_PERCENT,
-                )
-            )
-            q_current = q_approach.copy()
-
-            # 2. Linear plunge from APPROACH to START (MOVL)
-            ok_start, q_start, err_start = arm.inverse_kinematics(
-                target_pos=seam_start,
-                target_rot=tool_orientation,
-                q_init=q_current,
-            )
-            if not ok_start:
-                return {
-                    "status": "IK_UNREACHABLE",
-                    "robot_type": arm.robot_type,
-                    "waypoint": f"{seam_id}_START",
-                    "target_xyz": seam_start.tolist(),
-                    "target_tool_z": target_tool_z.tolist(),
-                    "position_error_mm": round(err_start, 3),
-                    "exceeded_coarse_reach": bool(
-                        np.linalg.norm(seam_start) > arm.max_reach_mm
+                    "waypoint": waypoint_label,
+                    "joint_jump_deg": round(joint_jump_deg, 3),
+                    "maximum_allowed_deg": allowed_jump_deg,
+                    "details": (
+                        "The selected IK branch creates a large joint-space "
+                        "jump from the previous waypoint."
                     ),
-                    "partial_plan_retained": False,
                 }
 
-            start_coll, start_msg = scene.check_chain_collision(
-                arm.forward_kinematics_chain(q_start)
+            waypoint_frames = arm.forward_kinematics_chain(q_solution)
+            collision_result = scene.check_chain_collision(
+                waypoint_frames,
+                allow_tool_contact=(
+                    waypoint_label.endswith("_START")
+                    or waypoint_label.endswith("_MID")
+                    or waypoint_label.endswith("_END")
+                ),
+                tool_contact_clearance_mm=0.0,
             )
-            if start_coll:
-                return {
-                    "status": "COLLISION_DETECTED",
-                    "robot_type": arm.robot_type,
-                    "waypoint": f"{seam_id}_START",
-                    "details": start_msg,
-                    "partial_plan_retained": False,
-                }
+
+
+            if collision_result.collided:
+                return _collision_failure_response(
+                    robot_type=arm.robot_type,
+                    waypoint=waypoint_label,
+                    collision_message=collision_result.message,
+                    obstacle_name=collision_result.obstacle_name,
+                    link_name=collision_result.link_name,
+                )
+
+            if move_type == "MOVJ":
+                traj_err = _check_movj_collision(
+                    arm=arm,
+                    q_start=q_previous,
+                    q_end=q_solution,
+                    waypoint_label=waypoint_label,
+                    robot_type=arm.robot_type,
+                    allow_tool_contact=waypoint_label.endswith("_RETRACT"),
+                )
+                if traj_err is not None:
+                    return traj_err
+
+
+
+
+            if waypoint_label.endswith("_END"):
+                q_weld_sample = q_previous.copy()
+
+                for sample_index, sample_xyz in enumerate(weld_path_samples):
+                    sample_ik_success, sample_q, sample_error = (
+                        arm.inverse_kinematics(
+                            target_pos=sample_xyz,
+                            target_rot=tool_orientation,
+                            q_init=q_weld_sample,
+                            max_iters=800,
+                            pos_tol=0.2,
+                            max_joint_jump_deg=MAX_WELD_SAMPLE_JOINT_JUMP_DEGREES,
+                        )
+                    )
+
+
+                    if not sample_ik_success:
+                        return _ik_failure_response(
+                            robot_type=arm.robot_type,
+                            waypoint=(
+                                f"{seam_id}_WELD_PATH_SAMPLE_{sample_index}"
+                            ),
+                            target_xyz=sample_xyz,
+                            position_error=sample_error,
+                        )
+
+                    sample_jump = arm.joint_jump(sample_q, q_weld_sample)
+
+                    if sample_jump > MAX_WELD_SAMPLE_JOINT_JUMP_DEGREES:
+                        return {
+                            "status": "JOINT_DISCONTINUITY",
+                            "robot_type": arm.robot_type,
+                            "waypoint": (
+                                f"{seam_id}_WELD_PATH_SAMPLE_{sample_index}"
+                            ),
+                            "joint_jump_deg": round(sample_jump, 3),
+                            "maximum_allowed_deg": MAX_WELD_SAMPLE_JOINT_JUMP_DEGREES,
+                            "details": (
+                                "Adjacent weld-path IK solutions select "
+                                "different branches."
+                            ),
+                        }
+
+                    sample_frames = arm.forward_kinematics_chain(sample_q)
+                    sample_collision = scene.check_chain_collision(
+                        sample_frames,
+                        allow_tool_contact=True,
+                        tool_contact_clearance_mm=0.0,
+                    )
+
+                    if sample_collision.collided:
+                        return _collision_failure_response(
+                            robot_type=arm.robot_type,
+                            waypoint=(
+                                f"{seam_id}_WELD_PATH_SAMPLE_{sample_index}"
+                            ),
+                            collision_message=sample_collision.message,
+                            obstacle_name=sample_collision.obstacle_name,
+                            link_name=sample_collision.link_name,
+                        )
+
+                    q_weld_sample = sample_q.copy()
 
             planned_waypoints.append(
                 TrajectoryWaypoint(
-                    label=f"{seam_id}_START",
-                    move_type="MOVL",
-                    xyz_mm=seam_start,
-                    joints_deg=np.rad2deg(q_start),
+                    label=waypoint_label,
+                    move_type=move_type,
+                    xyz_mm=target_xyz,
+                    joints_deg=np.rad2deg(q_solution),
                     orientation=tool_orientation,
-                    arc_state="ARC_ON",
-                    tcp_speed_mm_s=weld_speed_mm_s,
-                )
-            )
-            q_current = q_start.copy()
-
-            # 3. Uniform dense Cartesian sampling along the weld seam with sequential q_init tracking
-            weld_samples = np.linspace(
-                seam_start, seam_end, WELD_PATH_COLLISION_SAMPLES
-            )
-            q_prev_sample = q_start.copy()
-            q_mid = q_start.copy()
-            q_end = q_start.copy()
-            mid_index = WELD_PATH_COLLISION_SAMPLES // 2
-
-            for sample_idx, sample_xyz in enumerate(weld_samples):
-                s_ok, s_q, s_err = arm.inverse_kinematics(
-                    target_pos=sample_xyz,
-                    target_rot=tool_orientation,
-                    q_init=q_prev_sample,
-                )
-                if not s_ok:
-                    return {
-                        "status": "IK_UNREACHABLE",
-                        "robot_type": arm.robot_type,
-                        "waypoint": f"{seam_id}_WELD_SAMPLE_{sample_idx}",
-                        "target_xyz": sample_xyz.tolist(),
-                        "target_tool_z": target_tool_z.tolist(),
-                        "position_error_mm": round(s_err, 3),
-                        "exceeded_coarse_reach": bool(
-                            np.linalg.norm(sample_xyz) > arm.max_reach_mm
-                        ),
-                        "partial_plan_retained": False,
-                    }
-
-                sample_jump = arm.joint_jump(s_q, q_prev_sample)
-                if sample_jump > MAX_SAMPLE_JOINT_JUMP_DEGREES:
-                    return {
-                        "status": "JOINT_DISCONTINUITY",
-                        "robot_type": arm.robot_type,
-                        "waypoint": f"{seam_id}_WELD_SAMPLE_{sample_idx}",
-                        "details": (
-                            f"Branch flip / excessive joint jump ({sample_jump:.1f} deg) "
-                            f"between adjacent weld samples."
-                        ),
-                        "partial_plan_retained": False,
-                    }
-
-                s_coll, s_msg = scene.check_chain_collision(
-                    arm.forward_kinematics_chain(s_q)
-                )
-                if s_coll:
-                    return {
-                        "status": "COLLISION_DETECTED",
-                        "robot_type": arm.robot_type,
-                        "waypoint": f"{seam_id}_WELD_SAMPLE_{sample_idx}",
-                        "details": s_msg,
-                        "partial_plan_retained": False,
-                    }
-
-                if sample_idx == mid_index:
-                    q_mid = s_q.copy()
-                if sample_idx == WELD_PATH_COLLISION_SAMPLES - 1:
-                    q_end = s_q.copy()
-
-                q_prev_sample = s_q.copy()
-
-            mid_xyz = 0.5 * (seam_start + seam_end)
-            planned_waypoints.append(
-                TrajectoryWaypoint(
-                    label=f"{seam_id}_MID",
-                    move_type="MOVL",
-                    xyz_mm=mid_xyz,
-                    joints_deg=np.rad2deg(q_mid),
-                    orientation=tool_orientation,
-                    tcp_speed_mm_s=weld_speed_mm_s,
-                )
-            )
-            planned_waypoints.append(
-                TrajectoryWaypoint(
-                    label=f"{seam_id}_END",
-                    move_type="MOVL",
-                    xyz_mm=seam_end,
-                    joints_deg=np.rad2deg(q_end),
-                    orientation=tool_orientation,
-                    arc_state="ARC_OFF",
-                    tcp_speed_mm_s=weld_speed_mm_s,
-                )
-            )
-            q_current = q_end.copy()
-
-            # 4. Solve and continuously check retract segment (q_end -> q_retract)
-            ok_ret, q_retract, err_ret = arm.inverse_kinematics(
-                target_pos=retract_xyz,
-                target_rot=tool_orientation,
-                q_init=q_current,
-            )
-            if not ok_ret:
-                return {
-                    "status": "IK_UNREACHABLE",
-                    "robot_type": arm.robot_type,
-                    "waypoint": f"{seam_id}_RETRACT",
-                    "target_xyz": retract_xyz.tolist(),
-                    "target_tool_z": target_tool_z.tolist(),
-                    "position_error_mm": round(err_ret, 3),
-                    "exceeded_coarse_reach": bool(
-                        np.linalg.norm(retract_xyz) > arm.max_reach_mm
+                    arc_state=arc_command,
+                    tcp_speed_mm_s=(
+                        speed if move_type == "MOVL" else None
                     ),
-                    "partial_plan_retained": False,
-                }
-
-            ret_err = _check_joint_space_segment_collisions(
-                arm=arm,
-                q_start=q_current,
-                q_end=q_retract,
-                segment_label=f"{seam_id}_TO_RETRACT",
-                robot_type=arm.robot_type,
-            )
-            if ret_err is not None:
-                return ret_err
-
-            planned_waypoints.append(
-                TrajectoryWaypoint(
-                    label=f"{seam_id}_RETRACT",
-                    move_type="MOVJ",
-                    xyz_mm=retract_xyz,
-                    joints_deg=np.rad2deg(q_retract),
-                    orientation=tool_orientation,
-                    joint_speed_percent=DEFAULT_APPROACH_JOINT_SPEED_PERCENT,
+                    joint_speed_percent=(
+                        HOME_JOINT_SPEED_PERCENT if move_type == "MOVJ" else None
+                    ),
                 )
             )
-            q_current = q_retract.copy()
+            
+            previous_frames = waypoint_frames
+            q_previous = q_solution.copy()
+        
+        transit_res = _append_safe_transit(q_previous, f"{seam_id}_SAFE_TRANSIT")
+        if transit_res is None:
+            return {
+                "status": "SAFE_TRANSIT_UNAVAILABLE",
+                "robot_type": arm.robot_type,
+                "waypoint": f"{seam_id}_SAFE_TRANSIT",
+                "details": (
+                    "Could not find a collision-free transit configuration "
+                    "above the workpiece."
+                ),
+            }
+        q_previous, previous_frames = transit_res
+    
+    # <--- ВСТАВИТЬ СЮДА (перед RETURN_HOME):
+    final_transit_result = _append_safe_transit(
+        q_previous,
+        "FINAL_SAFE_TRANSIT",
+    )
 
-        # 5. Return to HOME_SAFE with continuous joint-space collision check
-        ok_ret_home, q_ret_home, err_ret_home = arm.inverse_kinematics(
+    if final_transit_result is None:
+        return {
+            "status": "SAFE_TRANSIT_UNAVAILABLE",
+            "robot_type": arm.robot_type,
+            "waypoint": "FINAL_SAFE_TRANSIT",
+            "details": (
+                "Could not find a collision-free transit configuration "
+                "before returning home."
+            ),
+        }
+
+    q_previous, previous_frames = final_transit_result
+    
+    return_home_ik_success, q_return_home, return_position_error = (
+        arm.inverse_kinematics(
             target_pos=home_xyz,
             target_rot=home_tool_orientation,
-            q_init=q_current,
+            q_init=q_previous,
+            max_joint_jump_deg=MAX_MOVJ_JOINT_JUMP_DEGREES,
         )
-        if not ok_ret_home:
-            return {
-                "status": "IK_UNREACHABLE",
-                "robot_type": arm.robot_type,
-                "waypoint": "RETURN_HOME",
-                "target_xyz": home_xyz.tolist(),
-                "target_tool_z": home_tool_z.tolist(),
-                "position_error_mm": round(err_ret_home, 3),
-                "exceeded_coarse_reach": False,
-                "partial_plan_retained": False,
+    )
+
+    if not return_home_ik_success:
+        return _ik_failure_response(
+            robot_type=arm.robot_type,
+            waypoint="RETURN_HOME",
+            target_xyz=home_xyz,
+            position_error=return_position_error,
+        )
+
+    return_traj_err = _check_movj_collision(
+        arm=arm,
+        q_start=q_previous,
+        q_end=q_return_home,
+        waypoint_label="RETURN_HOME",
+        robot_type=arm.robot_type,
+    )
+    if return_traj_err is not None:
+        return return_traj_err
+    
+    planned_waypoints.append(
+        TrajectoryWaypoint(
+            label="RETURN_HOME",
+            move_type="MOVJ",
+            xyz_mm=home_xyz,
+            joints_deg=np.rad2deg(q_return_home),
+            orientation=home_tool_orientation,
+            joint_speed_percent=APPROACH_JOINT_SPEED_PERCENT,
+        )
+    )
+
+    plan_id = f"plan_{uuid.uuid4().hex[:12]}"
+    plan = ValidatedPlan(
+        plan_id=plan_id,
+        robot_type=arm.robot_type,
+        waypoints=planned_waypoints,
+    )
+
+    _store_plan(plan)
+
+    return {
+        "status": "VALIDATED_OK",
+        "validation_level": "kinematic_and_static_collision",
+        "plan_id": plan_id,
+        "robot_type": arm.robot_type,
+        "dof": arm.dof,
+        "seams_planned": seam_ids,
+        "total_waypoints": len(planned_waypoints),
+        "weld_path_samples_per_seam": WELD_PATH_COLLISION_SAMPLES,
+        "warnings": [
+            "Collision checking uses conservative capsule approximations, "
+            "not mesh-accurate robot or tool geometry.",
+            "Validate the robot mounting transform, tool frame, controller "
+            "postprocessor, and welding-interface commands before production."
+        ],
+        "waypoints_summary": [
+            {
+                "label": waypoint.label,
+                "move": waypoint.move_type,
+                "xyz": np.round(waypoint.xyz_mm, 1).tolist(),
+                "joints": np.round(waypoint.joints_deg, 1).tolist(),
+                "arc": waypoint.arc_state,
+                "tcp_speed_mm_s": waypoint.tcp_speed_mm_s,
+                "joint_speed_percent": waypoint.joint_speed_percent,
             }
+            for waypoint in planned_waypoints
+        ],
 
-        ret_home_coll = _check_joint_space_segment_collisions(
-            arm=arm,
-            q_start=q_current,
-            q_end=q_ret_home,
-            segment_label="RETURN_HOME",
-            robot_type=arm.robot_type,
+    }
+
+def _check_movj_collision(
+    arm,
+    q_start: np.ndarray,
+    q_end: np.ndarray,
+    waypoint_label: str,
+    robot_type: str,
+    allow_tool_contact: bool = False,
+) -> dict | None:
+    for alpha in np.linspace(0.0, 1.0, MOVJ_COLLISION_SAMPLES):
+        q_interp = (1.0 - alpha) * q_start + alpha * q_end
+        interp_frames = arm.forward_kinematics_chain(q_interp)
+        res = scene.check_chain_collision(
+            interp_frames,
+            allow_tool_contact=allow_tool_contact,
         )
-        if ret_home_coll is not None:
-            return ret_home_coll
-
-        planned_waypoints.append(
-            TrajectoryWaypoint(
-                label="RETURN_HOME",
-                move_type="MOVJ",
-                xyz_mm=home_xyz,
-                joints_deg=np.rad2deg(q_ret_home),
-                orientation=home_tool_orientation,
-                joint_speed_percent=DEFAULT_TRANSIT_JOINT_SPEED_PERCENT,
+        if res.collided:
+            return _collision_failure_response(
+                robot_type=robot_type,
+                waypoint=f"{waypoint_label}_TRAJECTORY",
+                collision_message=f"{res.message} (alpha={alpha:.3f})",
+                obstacle_name=res.obstacle_name,
+                link_name=res.link_name,
             )
-        )
-
-        plan_id = f"plan_{uuid.uuid4().hex[:12]}"
-        record = ValidatedPlanRecord(
-            plan_id=plan_id,
-            robot_type=arm.robot_type,
-                        dof=arm.dof,
-            seams_planned=list(seam_ids),
-            waypoints=tuple(planned_waypoints),
-        )
-        validated_plans[plan_id] = record
-        latest_plan_id = plan_id
-
-        return {
-            "status": "VALIDATED_OK",
-            "validation_level": "kinematic_and_continuous_static_collision",
-            "plan_id": plan_id,
-            "robot_type": arm.robot_type,
-            "dof": arm.dof,
-            "seams_planned": list(seam_ids),
-            "total_waypoints": len(planned_waypoints),
-            "collision_free": True,
-            "weld_path_samples_per_seam": WELD_PATH_COLLISION_SAMPLES,
-            "movj_samples_per_segment": MOVJ_COLLISION_SAMPLES,
-            "waypoints_summary": [
-                {
-                    "label": wp.label,
-                    "move": wp.move_type,
-                    "xyz": np.round(wp.xyz_mm, 1).tolist(),
-                    "joints": np.round(wp.joints_deg, 1).tolist(),
-                    "arc": wp.arc_state,
-                }
-                for wp in planned_waypoints
-            ],
-        }
-
-    except np.linalg.LinAlgError as exc:
-        return {
-            "status": "IK_SOLVER_ERROR",
-            "reason": f"Linear algebra failure during IK: {exc}",
-            "partial_plan_retained": False,
-        }
-    except Exception as exc:
-        logger.exception("Weld planning failed unexpectedly")
-        return {
-            "status": "INTERNAL_ERROR",
-            "reason": str(exc),
-            "partial_plan_retained": False,
-        }
+    return None
 
 
 @mcp.tool()
 def export_robot_program(
+    plan_id: str,
     dialect: str = "melfa",
     program_name: str = "WELD_JOB_01",
-    plan_id: str | None = None,
 ) -> dict:
-    """
-    Compiles a validated trajectory (by plan_id or latest validated plan)
-    into vendor-specific robot controller code.
-    """
-    target_id = plan_id if plan_id is not None else latest_plan_id
-    if target_id is None or target_id not in validated_plans:
-        return {
-            "status": "ERROR",
-            "reason": (
-                "No matching validated trajectory found. "
-                "Call plan_and_simulate_weld first or pass a valid plan_id."
-            ),
-        }
-
-    sanitized_name = program_name.strip()
-    if not PROGRAM_NAME_PATTERN.match(sanitized_name):
-        return {
-            "status": "ERROR",
-            "reason": (
-                "Invalid program_name. Use 1-64 alphanumeric characters, "
-                "underscores, or hyphens."
-            ),
-        }
+    """Compiles a previously validated trajectory into robot-controller code."""
+    plan = _get_plan(plan_id)
 
     normalized_dialect = dialect.strip().lower()
-    if normalized_dialect not in SUPPORTED_PROGRAM_DIALECTS:
-        return {
-            "status": "ERROR",
-            "reason": (
-                f"Unsupported dialect '{dialect}'. "
-                f"Supported dialects: {sorted(SUPPORTED_PROGRAM_DIALECTS)}."
-            ),
-        }
 
-    record = validated_plans[target_id]
-    program_code = compile_program(
-        list(record.waypoints),
-        dialect=normalized_dialect,
-        program_name=sanitized_name,
-        robot_type=record.robot_type,
-    )
+    if normalized_dialect not in SUPPORTED_PROGRAM_DIALECTS:
+        raise ToolError(
+            f"Unsupported dialect '{dialect}'. Supported dialects: "
+            f"{sorted(SUPPORTED_PROGRAM_DIALECTS)}."
+        )
+
+    try:
+        program_code = compile_program(
+            plan.waypoints,
+            dialect=normalized_dialect,
+            program_name=program_name,
+            robot_type=plan.robot_type,
+            config=WELDING_POSTPROCESSOR_CONFIG,
+        )
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
     return {
         "status": "COMPILED",
-        "plan_id": record.plan_id,
-        "robot_type": record.robot_type,
+        "plan_id": plan.plan_id,
+        "robot_type": plan.robot_type,
         "dialect": normalized_dialect,
         "line_count": len(program_code.splitlines()),
         "program_code": program_code,
@@ -625,5 +734,3 @@ def export_robot_program(
 
 if __name__ == "__main__":
     mcp.run()
-
-
