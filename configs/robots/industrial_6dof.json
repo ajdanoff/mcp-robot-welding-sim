@@ -1,0 +1,28 @@
+{
+  "robot_type": "industrial_6dof",
+  "description": "6-DoF industrial welding arm with spherical wrist",
+  "max_reach_mm": 1350.0,
+  "position_only_orientation": false,
+  "tool_z_points_into_workpiece": true,
+  "dh_table": [
+    {"a": 150.0, "alpha_deg": -90.0, "d": 400.0, "joint_type": "revolute"},
+    {"a": 550.0, "alpha_deg": 0.0, "d": 0.0, "theta_offset_deg": -90.0, "joint_type": "revolute"},
+    {"a": 120.0, "alpha_deg": -90.0, "d": 0.0, "joint_type": "revolute"},
+    {"a": 0.0, "alpha_deg": 90.0, "d": 500.0, "joint_type": "revolute"},
+    {"a": 0.0, "alpha_deg": -90.0, "d": 0.0, "joint_type": "revolute"},
+    {"a": 0.0, "alpha_deg": 0.0, "d": 120.0, "joint_type": "revolute"}
+  ],
+  "joint_limits": [
+    {"min": -170, "max": 170, "unit": "deg"},
+    {"min": -135, "max": 135, "unit": "deg"},
+    {"min": -150, "max": 160, "unit": "deg"},
+    {"min": -185, "max": 185, "unit": "deg"},
+    {"min": -135, "max": 135, "unit": "deg"},
+    {"min": -350, "max": 350, "unit": "deg"}
+  ],
+  "seeds": [
+    [0, 0, 0, 0, 0, 0],
+    [0, 0.2, 0.5, 0, 0.8, 0],
+    [0, -0.3, 0.8, 0, 0.9, 0]
+  ]
+}

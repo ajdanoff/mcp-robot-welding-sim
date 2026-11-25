@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
-
 
 SUPPORTED_MOVE_TYPES = {"MOVJ", "MOVL"}
 SUPPORTED_ARC_STATES = {"ARC_ON", "ARC_OFF", None}

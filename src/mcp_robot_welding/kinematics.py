@@ -1,16 +1,118 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
-from typing import Literal
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
 
+from .load_robots import (
+    DEFAULT_ROBOT_CONFIG_DIR,
+    build_supported_robots_map,
+    load_robot_config_file,
+    load_robot_configs,
+    parse_angle_rad,
+    parse_joint_limit,
+)
 
 logger = logging.getLogger("mcp_robot_welding.kinematics")
 
 
 JointType = Literal["revolute", "prismatic"]
+
+_ROBOT_CONFIG_REGISTRY: dict[str, dict[str, Any]] | None = None
+SUPPORTED_ROBOTS: dict[str, str] = {}
+
+
+def _get_robot_registry(
+    config_dir: Path | str | None = None,
+) -> dict[str, dict[str, Any]]:
+    global _ROBOT_CONFIG_REGISTRY
+
+    if config_dir is not None:
+        return load_robot_configs(config_dir)
+
+    if _ROBOT_CONFIG_REGISTRY is None:
+        _ROBOT_CONFIG_REGISTRY = load_robot_configs(DEFAULT_ROBOT_CONFIG_DIR)
+
+    return _ROBOT_CONFIG_REGISTRY
+
+
+def _refresh_supported_robots() -> dict[str, str]:
+    SUPPORTED_ROBOTS.clear()
+    SUPPORTED_ROBOTS.update(build_supported_robots_map(_get_robot_registry()))
+    return SUPPORTED_ROBOTS
+
+
+def reload_robot_configs(
+    config_dir: Path | str = DEFAULT_ROBOT_CONFIG_DIR,
+) -> dict[str, str]:
+    """Reloads robot configs from disk and updates `SUPPORTED_ROBOTS`."""
+    global _ROBOT_CONFIG_REGISTRY
+
+    _ROBOT_CONFIG_REGISTRY = load_robot_configs(config_dir)
+
+    SUPPORTED_ROBOTS.clear()
+    SUPPORTED_ROBOTS.update(build_supported_robots_map(_ROBOT_CONFIG_REGISTRY))
+
+    return SUPPORTED_ROBOTS
+
+
+def _build_manipulator_from_config(
+    config: dict[str, Any],
+) -> RobotManipulator:
+    """Instantiates a `RobotManipulator` from a validated config dictionary."""
+    robot_type = str(config["robot_type"])
+    dh_raw = config["dh_table"]
+    limits_raw = config["joint_limits"]
+    dof = len(dh_raw)
+
+    dh_table: list[DHParameter] = [
+        DHParameter(
+            a=float(row["a"]),
+            alpha=parse_angle_rad(row, "alpha", "alpha_deg", 0.0),
+            d=float(row["d"]),
+            theta_offset=parse_angle_rad(row, "theta_offset", "theta_offset_deg", 0.0),
+            joint_type=str(row.get("joint_type", "revolute")),
+        )
+        for row in dh_raw
+    ]
+
+    joint_limits = [parse_joint_limit(limit_entry) for limit_entry in limits_raw]
+
+    seeds_raw = config.get("seeds") or [[0.0] * dof]
+    seeds: list[np.ndarray] = []
+
+    for seed_index, seed in enumerate(seeds_raw):
+        seed_array = np.asarray(seed, dtype=np.float64)
+
+        if seed_array.shape != (dof,):
+            raise ValueError(
+                f"Config for '{robot_type}': seed {seed_index} shape "
+                f"{seed_array.shape} does not match DOF ({dof})."
+            )
+
+        if not np.all(np.isfinite(seed_array)):
+            raise ValueError(
+                f"Config for '{robot_type}': seed {seed_index} "
+                "contains non-finite values."
+            )
+
+        seeds.append(seed_array.copy())
+
+    return RobotManipulator(
+        robot_type=robot_type,
+        description=str(config.get("description", robot_type)),
+        dh_table=dh_table,
+        joint_limits=joint_limits,
+        seeds=seeds,
+        max_reach_mm=float(config["max_reach_mm"]),
+        position_only_orientation=bool(config.get("position_only_orientation", False)),
+        tool_z_points_into_workpiece=bool(
+            config.get("tool_z_points_into_workpiece", True)
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -47,9 +149,7 @@ class RobotManipulator:
             raise ValueError("description must not be empty.")
 
         if len(dh_table) != len(joint_limits):
-            raise ValueError(
-                "dh_table and joint_limits must have equal length."
-            )
+            raise ValueError("dh_table and joint_limits must have equal length.")
 
         if not dh_table:
             raise ValueError("dh_table must contain at least one joint.")
@@ -67,16 +167,13 @@ class RobotManipulator:
         self.seeds = [np.asarray(seed, dtype=np.float64).copy() for seed in seeds]
         self.max_reach_mm = float(max_reach_mm)
         self.position_only_orientation = bool(position_only_orientation)
-        self.tool_z_points_into_workpiece = bool(
-            tool_z_points_into_workpiece
-        )
+        self.tool_z_points_into_workpiece = bool(tool_z_points_into_workpiece)
         self.dof = len(self.dh_table)
 
         for index, seed in enumerate(self.seeds):
             if seed.shape != (self.dof,):
                 raise ValueError(
-                    f"Seed {index} must have shape ({self.dof},); "
-                    f"got {seed.shape}."
+                    f"Seed {index} must have shape ({self.dof},); " f"got {seed.shape}."
                 )
 
             if not np.all(np.isfinite(seed)):
@@ -84,9 +181,7 @@ class RobotManipulator:
 
         for index, (lower, upper) in enumerate(self.joint_limits):
             if not np.isfinite(lower) or not np.isfinite(upper):
-                raise ValueError(
-                    f"Joint limit {index} contains non-finite values."
-                )
+                raise ValueError(f"Joint limit {index} contains non-finite values.")
 
             if lower > upper:
                 raise ValueError(
@@ -97,9 +192,7 @@ class RobotManipulator:
             values = (parameter.a, parameter.alpha, parameter.d, parameter.theta_offset)
 
             if not all(np.isfinite(value) for value in values):
-                raise ValueError(
-                    f"DH parameter {index} contains non-finite values."
-                )
+                raise ValueError(f"DH parameter {index} contains non-finite values.")
 
     @staticmethod
     def _dh_transform(
@@ -177,9 +270,7 @@ class RobotManipulator:
     ) -> np.ndarray:
         """Computes the 6xN geometric Jacobian from precomputed FK frames."""
         if len(frames) != self.dof + 1:
-            raise ValueError(
-                f"Expected {self.dof + 1} FK frames; got {len(frames)}."
-            )
+            raise ValueError(f"Expected {self.dof + 1} FK frames; got {len(frames)}.")
 
         tcp_position = frames[-1][:3, 3]
         jacobian = np.zeros((6, self.dof), dtype=np.float64)
@@ -271,7 +362,6 @@ class RobotManipulator:
 
         return value
 
-
     def _clip_to_joint_limits(self, joints: np.ndarray) -> np.ndarray:
         joints = self._validate_joint_vector(joints)
         clipped = joints.copy()
@@ -301,7 +391,9 @@ class RobotManipulator:
         tool_z_axis = tool_z_axis / norm
 
         if reference_x_axis is not None:
-            proj = reference_x_axis - np.dot(reference_x_axis, tool_z_axis) * tool_z_axis
+            proj = (
+                reference_x_axis - np.dot(reference_x_axis, tool_z_axis) * tool_z_axis
+            )
             if float(np.linalg.norm(proj)) > 1e-6:
                 tool_x_axis = proj / np.linalg.norm(proj)
                 tool_y_axis = np.cross(tool_z_axis, tool_x_axis)
@@ -316,7 +408,6 @@ class RobotManipulator:
         tool_y_axis = np.cross(tool_z_axis, tool_x_axis)
 
         return np.column_stack([tool_x_axis, tool_y_axis, tool_z_axis])
-
 
     def default_tool_orientation(self) -> np.ndarray:
         """
@@ -370,7 +461,7 @@ class RobotManipulator:
     ) -> float:
         """Backward-compatible alias for `joint_jump()`."""
         return self.joint_jump(q_new, q_old)
-    
+
     @staticmethod
     def _rotation_to_quaternion(
         rotation: np.ndarray,
@@ -385,38 +476,26 @@ class RobotManipulator:
             x = (rotation[2, 1] - rotation[1, 2]) / scale
             y = (rotation[0, 2] - rotation[2, 0]) / scale
             z = (rotation[1, 0] - rotation[0, 1]) / scale
-        elif (
-            rotation[0, 0] > rotation[1, 1]
-            and rotation[0, 0] > rotation[2, 2]
-        ):
-            scale = np.sqrt(
-                1.0
-                + rotation[0, 0]
-                - rotation[1, 1]
-                - rotation[2, 2]
-            ) * 2.0
+        elif rotation[0, 0] > rotation[1, 1] and rotation[0, 0] > rotation[2, 2]:
+            scale = (
+                np.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+            )
             scalar = (rotation[2, 1] - rotation[1, 2]) / scale
             x = 0.25 * scale
             y = (rotation[0, 1] + rotation[1, 0]) / scale
             z = (rotation[0, 2] + rotation[2, 0]) / scale
         elif rotation[1, 1] > rotation[2, 2]:
-            scale = np.sqrt(
-                1.0
-                + rotation[1, 1]
-                - rotation[0, 0]
-                - rotation[2, 2]
-            ) * 2.0
+            scale = (
+                np.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+            )
             scalar = (rotation[0, 2] - rotation[2, 0]) / scale
             x = (rotation[0, 1] + rotation[1, 0]) / scale
             y = 0.25 * scale
             z = (rotation[1, 2] + rotation[2, 1]) / scale
         else:
-            scale = np.sqrt(
-                1.0
-                + rotation[2, 2]
-                - rotation[0, 0]
-                - rotation[1, 1]
-            ) * 2.0
+            scale = (
+                np.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+            )
             scalar = (rotation[1, 0] - rotation[0, 1]) / scale
             x = (rotation[0, 2] + rotation[2, 0]) / scale
             y = (rotation[1, 2] + rotation[2, 1]) / scale
@@ -492,14 +571,10 @@ class RobotManipulator:
             target_rotation = np.asarray(target_rot, dtype=np.float64)
 
             if target_rotation.shape != (3, 3):
-                raise ValueError(
-                    "target_rot must be a 3x3 rotation matrix."
-                )
+                raise ValueError("target_rot must be a 3x3 rotation matrix.")
 
             if not np.all(np.isfinite(target_rotation)):
-                raise ValueError(
-                    "target_rot must contain only finite values."
-                )
+                raise ValueError("target_rot must contain only finite values.")
 
         if max_iters < 1:
             raise ValueError("max_iters must be at least 1.")
@@ -513,11 +588,7 @@ class RobotManipulator:
                 "must be non-negative."
             )
 
-        if not (
-            minimum_damping
-            <= initial_damping
-            <= maximum_damping
-        ):
+        if not (minimum_damping <= initial_damping <= maximum_damping):
             raise ValueError(
                 "Damping values must satisfy "
                 "minimum_damping <= initial_damping <= maximum_damping."
@@ -556,9 +627,7 @@ class RobotManipulator:
             pose = frames[-1]
 
             position_error = target_position - pose[:3, 3]
-            position_error_norm = float(
-                np.linalg.norm(position_error)
-            )
+            position_error_norm = float(np.linalg.norm(position_error))
 
             if self.position_only_orientation:
                 current_rotation = pose[:3, :3]
@@ -593,9 +662,7 @@ class RobotManipulator:
                     target_rotation,
                 )
 
-            rotation_error_norm = float(
-                np.linalg.norm(rotation_error)
-            )
+            rotation_error_norm = float(np.linalg.norm(rotation_error))
 
             weighted_error = np.concatenate(
                 [
@@ -604,9 +671,7 @@ class RobotManipulator:
                 ]
             )
 
-            task_cost = 0.5 * float(
-                weighted_error @ weighted_error
-            )
+            task_cost = 0.5 * float(weighted_error @ weighted_error)
 
             return (
                 frames,
@@ -617,9 +682,7 @@ class RobotManipulator:
                 task_cost,
             )
 
-        candidate_seeds = [
-            seed.copy() for seed in self.seeds
-        ]
+        candidate_seeds = [seed.copy() for seed in self.seeds]
 
         if q_init is not None:
             initial_joints = self._validate_joint_vector(q_init)
@@ -628,6 +691,7 @@ class RobotManipulator:
         best_fallback_q = candidate_seeds[0].copy()
         best_fallback_position_error = float("inf")
         best_fallback_task_cost = float("inf")
+        best_fallback_orientation_error = float("inf")
 
         best_valid_q: np.ndarray | None = None
         best_valid_joint_jump = float("inf")
@@ -662,17 +726,16 @@ class RobotManipulator:
                 nonlocal best_valid_position_error
                 nonlocal best_fallback_q
                 nonlocal best_fallback_position_error
+                nonlocal best_fallback_orientation_error
                 nonlocal best_fallback_task_cost
 
-                if (
-                    candidate_position_error < best_fallback_position_error
-                    or (
-                        candidate_position_error == best_fallback_position_error
-                        and candidate_task_cost < best_fallback_task_cost
-                    )
+                if candidate_position_error < best_fallback_position_error or (
+                    candidate_position_error == best_fallback_position_error
+                    and candidate_task_cost < best_fallback_task_cost
                 ):
                     best_fallback_q = candidate_joints.copy()
                     best_fallback_position_error = candidate_position_error
+                    best_fallback_orientation_error = candidate_rotation_error
                     best_fallback_task_cost = candidate_task_cost
 
                 position_ok = candidate_position_error < pos_tol
@@ -686,28 +749,25 @@ class RobotManipulator:
                     best_valid_position_error = candidate_position_error
                     return True
 
-                continuous_candidate = self._nearest_equivalent_configuration(
-                    candidate_joints,
-                    q_init,
-                )
                 joint_jump = self.joint_jump(
-                    continuous_candidate,
+                    self._nearest_equivalent_configuration(
+                        candidate_joints,
+                        q_init,
+                    ),
                     q_init,
                 )
 
                 if joint_jump < best_valid_joint_jump:
-                    best_valid_q = continuous_candidate.copy()
+                    best_valid_q = self._nearest_equivalent_configuration(
+                        candidate_joints,
+                        q_init,
+                    ).copy()
                     best_valid_joint_jump = joint_jump
                     best_valid_position_error = candidate_position_error
 
-                if (
-                    max_joint_jump_deg is not None
-                    and joint_jump <= max_joint_jump_deg
-                ):
-                    return True
-
-                return False
-
+                return bool(
+                    max_joint_jump_deg is not None and joint_jump <= max_joint_jump_deg
+                )
 
             if record_solution(
                 q,
@@ -715,16 +775,12 @@ class RobotManipulator:
                 rotation_error_norm,
                 task_cost,
             ):
-                
+
                 assert best_valid_q is not None
                 return True, best_valid_q.copy(), best_valid_position_error
 
-
             for _ in range(max_iters):
-                if (
-                    position_error_norm < pos_tol
-                    and rotation_error_norm < rot_tol
-                ):
+                if position_error_norm < pos_tol and rotation_error_norm < rot_tol:
                     if q_init is None:
                         return (
                             True,
@@ -741,15 +797,10 @@ class RobotManipulator:
                     ]
                 )
 
-                jacobian = self.compute_jacobian_from_frames(
-                    frames
-                )
+                jacobian = self.compute_jacobian_from_frames(frames)
 
                 try:
-                    damped_matrix = (
-                        jacobian @ jacobian.T
-                        + damping**2 * identity_6
-                    )
+                    damped_matrix = jacobian @ jacobian.T + damping**2 * identity_6
                     full_step = jacobian.T @ np.linalg.solve(
                         damped_matrix,
                         weighted_error,
@@ -776,9 +827,7 @@ class RobotManipulator:
                 accepted = False
 
                 for step_scale in (1.0, 0.5, 0.25, 0.1):
-                    candidate_q = self._clip_to_joint_limits(
-                        q + step_scale * full_step
-                    )
+                    candidate_q = self._clip_to_joint_limits(q + step_scale * full_step)
 
                     (
                         candidate_frames,
@@ -794,12 +843,8 @@ class RobotManipulator:
                         frames = candidate_frames
                         position_error = candidate_position_error
                         rotation_error = candidate_rotation_error
-                        position_error_norm = (
-                            candidate_position_error_norm
-                        )
-                        rotation_error_norm = (
-                            candidate_rotation_error_norm
-                        )
+                        position_error_norm = candidate_position_error_norm
+                        rotation_error_norm = candidate_rotation_error_norm
                         task_cost = candidate_task_cost
 
                         damping = max(
@@ -815,7 +860,7 @@ class RobotManipulator:
                             rotation_error_norm,
                             task_cost,
                         ):
-                            
+
                             assert best_valid_q is not None
                             return True, best_valid_q.copy(), best_valid_position_error
 
@@ -828,18 +873,13 @@ class RobotManipulator:
                     )
                     stagnation_count += 1
 
-                    if (
-                        damping >= maximum_damping
-                        and stagnation_count >= 5
-                    ):
+                    if damping >= maximum_damping and stagnation_count >= 5:
                         perturbation = random_generator.normal(
                             0.0,
                             0.01,
                             size=self.dof,
                         )
-                        q = self._clip_to_joint_limits(
-                            q + perturbation
-                        )
+                        q = self._clip_to_joint_limits(q + perturbation)
 
                         (
                             frames,
@@ -859,7 +899,7 @@ class RobotManipulator:
                             rotation_error_norm,
                             task_cost,
                         ):
-                            
+
                             return (
                                 True,
                                 q.copy(),
@@ -872,20 +912,28 @@ class RobotManipulator:
                 best_valid_q.copy(),
                 best_valid_position_error,
             )
-
+        logger.warning(
+            "[%s] IK failed for target %s: position_error=%.6f mm, "
+            "orientation_error=%.6f rad (%.3f deg).",
+            self.robot_type,
+            np.round(target_position, 3).tolist(),
+            best_fallback_position_error,
+            best_fallback_orientation_error,
+            np.rad2deg(best_fallback_orientation_error),
+        )
         return (
             False,
             best_fallback_q.copy(),
             best_fallback_position_error,
         )
-    
+
     @staticmethod
     def _normalize_angle_difference(
         angle_difference: float,
     ) -> float:
         """Wraps an angular difference into [-pi, pi]."""
         return (angle_difference + np.pi) % (2.0 * np.pi) - np.pi
-    
+
     def _nearest_equivalent_configuration(
         self,
         q_candidate: np.ndarray,
@@ -925,133 +973,34 @@ SUPPORTED_ROBOTS: dict[str, str] = {
         "(UR5/UR10-inspired synthetic kinematic profile)."
     ),
     "scara_4dof": (
-        "4-DoF SCARA vertical spot-welding robot "
-        "(R-R-P-R kinematic chain)."
+        "4-DoF SCARA vertical spot-welding robot " "(R-R-P-R kinematic chain)."
     ),
 }
 
 
 def create_manipulator(
     robot_type: str = "industrial_6dof",
+    config_path: Path | str | None = None,
+    config_dir: Path | str | None = None,
 ) -> RobotManipulator:
-    """Creates a configured kinematic model for a supported robot type."""
+    """
+    Creates a configured kinematic model from a JSON config file or
+    registered robot type.
+    """
+    if config_path is not None:
+        config = load_robot_config_file(config_path)
+        return _build_manipulator_from_config(config)
+
+    registry = _get_robot_registry(config_dir)
     key = robot_type.strip().lower()
 
-    if key == "industrial_6dof":
-        return RobotManipulator(
-            robot_type="industrial_6dof",
-            description=SUPPORTED_ROBOTS["industrial_6dof"],
-            dh_table=[
-                DHParameter(a=150.0, alpha=-np.pi / 2, d=400.0),
-                DHParameter(
-                    a=550.0,
-                    alpha=0.0,
-                    d=0.0,
-                    theta_offset=-np.pi / 2,
-                ),
-                DHParameter(a=120.0, alpha=-np.pi / 2, d=0.0),
-                DHParameter(a=0.0, alpha=np.pi / 2, d=500.0),
-                DHParameter(a=0.0, alpha=-np.pi / 2, d=0.0),
-                DHParameter(a=0.0, alpha=0.0, d=120.0),
-            ],
-            joint_limits=[
-                (-np.deg2rad(170.0), np.deg2rad(170.0)),
-                (-np.deg2rad(135.0), np.deg2rad(135.0)),
-                (-np.deg2rad(150.0), np.deg2rad(160.0)),
-                (-np.deg2rad(185.0), np.deg2rad(185.0)),
-                (-np.deg2rad(135.0), np.deg2rad(135.0)),
-                (-np.deg2rad(350.0), np.deg2rad(350.0)),
-            ],
-            seeds=[
-                np.zeros(6, dtype=np.float64),
-                np.array([0.0, 0.2, 0.5, 0.0, 0.8, 0.0]),
-                np.array([0.0, -0.3, 0.8, 0.0, 0.9, 0.0]),
-            ],
-            max_reach_mm=1350.0,
-            tool_z_points_into_workpiece=True,
+    if key not in registry:
+        raise ValueError(
+            f"Unknown robot_type '{robot_type}'. Supported models: "
+            f"{sorted(registry.keys())}."
         )
 
-    if key == "cobot_6dof":
-        return RobotManipulator(
-            robot_type="cobot_6dof",
-            description=SUPPORTED_ROBOTS["cobot_6dof"],
-            dh_table=[
-                DHParameter(a=0.0, alpha=np.pi / 2, d=180.0),
-                DHParameter(a=-500.0, alpha=0.0, d=0.0),
-                DHParameter(a=-450.0, alpha=0.0, d=0.0),
-                DHParameter(a=0.0, alpha=np.pi / 2, d=130.0),
-                DHParameter(a=0.0, alpha=-np.pi / 2, d=100.0),
-                DHParameter(a=0.0, alpha=0.0, d=110.0),
-            ],
-            joint_limits=[
-                (-2.0 * np.pi, 2.0 * np.pi),
-                (-2.0 * np.pi, 2.0 * np.pi),
-                (-np.deg2rad(165.0), np.deg2rad(165.0)),
-                (-2.0 * np.pi, 2.0 * np.pi),
-                (-2.0 * np.pi, 2.0 * np.pi),
-                (-2.0 * np.pi, 2.0 * np.pi),
-            ],
-            seeds=[
-                np.array([2.9, -2.1, 1.5, -1.0, -1.57, 0.0]),
-                np.array([-2.9, -2.1, 1.5, -1.0, -1.57, 0.0]),
-                np.array([3.14, -1.8, 1.2, -1.0, -1.57, 0.0]),
-            ],
-            max_reach_mm=1200.0,
-            tool_z_points_into_workpiece=True,
-        )
-
-    if key == "scara_4dof":
-        return RobotManipulator(
-            robot_type="scara_4dof",
-            description=SUPPORTED_ROBOTS["scara_4dof"],
-            dh_table=[
-                DHParameter(
-                    a=450.0,
-                    alpha=0.0,
-                    d=520.0,
-                    joint_type="revolute",
-                ),
-                DHParameter(
-                    a=400.0,
-                    alpha=np.pi,
-                    d=0.0,
-                    joint_type="revolute",
-                ),
-                DHParameter(
-                    a=0.0,
-                    alpha=0.0,
-                    d=0.0,
-                    joint_type="prismatic",
-                ),
-                DHParameter(
-                    a=0.0,
-                    alpha=0.0,
-                    d=60.0,
-                    joint_type="revolute",
-                ),
-            ],
-            joint_limits=[
-                (-np.deg2rad(150.0), np.deg2rad(150.0)),
-                (-np.deg2rad(145.0), np.deg2rad(145.0)),
-                (0.0, 350.0),
-                (-np.pi, np.pi),
-            ],
-            seeds=[
-                np.array([0.4, -0.8, 100.0, 0.0]),
-                np.array([-0.4, 0.8, 100.0, 0.0]),
-            ],
-            max_reach_mm=1100.0,
-            position_only_orientation=True,
-            # The current DH chain leaves the tool Z axis along base +Z.
-            # Set False unless a tool/flange rotation makes the actual TCP
-            # Z axis point downward.
-            tool_z_points_into_workpiece=False,
-        )
-
-    raise ValueError(
-        f"Unknown robot_type '{robot_type}'. Supported models: "
-        f"{sorted(SUPPORTED_ROBOTS.keys())}."
-    )
+    return _build_manipulator_from_config(registry[key])
 
 
 class SixDofArm(RobotManipulator):
@@ -1067,9 +1016,8 @@ class SixDofArm(RobotManipulator):
             joint_limits=default_arm.joint_limits,
             seeds=default_arm.seeds,
             max_reach_mm=default_arm.max_reach_mm,
-            tool_z_points_into_workpiece=(
-                default_arm.tool_z_points_into_workpiece
-            ),
+            position_only_orientation=(default_arm.position_only_orientation),
+            tool_z_points_into_workpiece=(default_arm.tool_z_points_into_workpiece),
         )
 
 
@@ -1077,13 +1025,9 @@ def _as_vector3(value: object, field_name: str) -> np.ndarray:
     vector = np.asarray(value, dtype=np.float64)
 
     if vector.shape != (3,):
-        raise ValueError(
-            f"{field_name} must contain exactly three coordinates."
-        )
+        raise ValueError(f"{field_name} must contain exactly three coordinates.")
 
     if not np.all(np.isfinite(vector)):
-        raise ValueError(
-            f"{field_name} must contain only finite values."
-        )
+        raise ValueError(f"{field_name} must contain only finite values.")
 
     return vector

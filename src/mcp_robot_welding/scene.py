@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field, field_validator, model_validator
-
 
 Vector3 = list[float]
 
@@ -76,7 +75,7 @@ class WeldSeam(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def validate_and_normalize(self) -> "WeldSeam":
+    def validate_and_normalize(self) -> WeldSeam:
         start = _as_vector3(self.start_xyz, "start_xyz")
         end = _as_vector3(self.end_xyz, "end_xyz")
         normal = _as_vector3(self.normal_xyz, "normal_xyz")
@@ -138,9 +137,7 @@ class AABB:
         max_pt = _as_vector3(self.max_pt, "max_pt")
 
         if np.any(min_pt > max_pt):
-            raise ValueError(
-                f"AABB '{self.name}': min_pt must not exceed max_pt."
-            )
+            raise ValueError(f"AABB '{self.name}': min_pt must not exceed max_pt.")
 
         if self.collision_margin_mm < 0.0:
             raise ValueError(
@@ -157,7 +154,7 @@ class AABB:
     ) -> bool:
         point = _as_vector3(point, "point")
 
-        #if margin < 0.0:
+        # if margin < 0.0:
         #    raise ValueError("margin must be non-negative.")
 
         lower = self.min_pt - margin
@@ -192,10 +189,7 @@ class AABB:
 
         for axis in range(3):
             if abs(float(delta[axis])) < 1e-12:
-                if (
-                    start[axis] < lower[axis]
-                    or start[axis] > upper[axis]
-                ):
+                if start[axis] < lower[axis] or start[axis] > upper[axis]:
                     return False
                 continue
 
@@ -242,9 +236,7 @@ class LinkGeometry:
             )
 
         if self.radius_mm <= 0.0:
-            raise ValueError(
-                f"LinkGeometry '{self.name}': radius_mm must be positive."
-            )
+            raise ValueError(f"LinkGeometry '{self.name}': radius_mm must be positive.")
 
         if self.collision_margin_mm < 0.0:
             raise ValueError(
@@ -290,9 +282,7 @@ class WorkpieceScene:
             )
 
         if not np.allclose(base[3, :], [0.0, 0.0, 0.0, 1.0]):
-            raise ValueError(
-                "robot_base_transform must have bottom row [0, 0, 0, 1]."
-            )
+            raise ValueError("robot_base_transform must have bottom row [0, 0, 0, 1].")
 
         self.robot_base_transform = base.copy()
         self.robot_base_transform.flags.writeable = False
@@ -400,18 +390,29 @@ class WorkpieceScene:
             frame_array = np.asarray(frame, dtype=np.float64)
 
             if frame_array.shape != (4, 4):
-                raise ValueError(
-                    "Each joint frame must be a 4x4 homogeneous matrix."
-                )
+                raise ValueError("Each joint frame must be a 4x4 homogeneous matrix.")
 
             if not np.all(np.isfinite(frame_array)):
-                raise ValueError(
-                    "Each joint frame must contain only finite values."
-                )
+                raise ValueError("Each joint frame must contain only finite values.")
 
             world_frames.append(self.robot_base_transform @ frame_array)
 
         return world_frames
+
+    def get_safe_transit_position(
+        self,
+        robot_type: str,
+    ) -> np.ndarray:
+        if robot_type == "scara_4dof":
+            return np.array(
+                [450.0, 0.0, 430.0],
+                dtype=np.float64,
+            )
+
+        return np.array(
+            [450.0, 0.0, 650.0],
+            dtype=np.float64,
+        )
 
     def check_point_collision(
         self,
@@ -471,10 +472,7 @@ class WorkpieceScene:
             elif obstacle.contains_point(point, margin=margin):
                 return CollisionResult(
                     collided=True,
-                    message=(
-                        f"Point collides with workpiece "
-                        f"'{obstacle.name}'."
-                    ),
+                    message=(f"Point collides with workpiece " f"'{obstacle.name}'."),
                     obstacle_name=obstacle.name,
                     sample_point_mm=point,
                 )
@@ -560,7 +558,7 @@ class WorkpieceScene:
                 # The tool contact point may approach the workpiece, but the
                 # capsule must not penetrate the workpiece solid.
                 workpiece_margin = 0.0
-            
+
             for obstacle in self.workpiece_obstacles:
                 if obstacle.intersects_segment(
                     start_point,
@@ -618,9 +616,7 @@ class WorkpieceScene:
             raise ValueError("samples must be at least 2.")
 
         if len(joint_frames_start) != len(joint_frames_end):
-            raise ValueError(
-                "Start and end joint-frame lists must have equal length."
-            )
+            raise ValueError("Start and end joint-frame lists must have equal length.")
 
         for alpha in np.linspace(0.0, 1.0, samples):
             interpolated_frames: list[np.ndarray] = []
@@ -656,6 +652,151 @@ class WorkpieceScene:
 
         return CollisionResult(collided=False, message="OK")
 
+    def check_cartesian_trajectory_collision(
+        self,
+        arm: Any,
+        q_start: np.ndarray,
+        target_positions: np.ndarray,
+        target_orientation: np.ndarray,
+        *,
+        samples: int = 25,
+        allow_tool_contact: bool = False,
+        tool_contact_clearance_mm: float = 0.0,
+        max_joint_jump_deg: float = 15.0,
+        start_tolerance_mm: float = 0.5,
+    ) -> tuple[CollisionResult, np.ndarray | None]:
+        """
+        Checks a Cartesian MOVL trajectory for reachability, continuity,
+        and static collision.
+
+        `target_positions` must be an (N, 3) array of TCP positions in mm.
+        The first position should normally equal the TCP position produced by
+        `q_start`.
+        """
+        if samples < 2:
+            raise ValueError("samples must be at least 2.")
+
+        positions = np.asarray(
+            target_positions,
+            dtype=np.float64,
+        )
+
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            raise ValueError("target_positions must have shape (N, 3).")
+
+        if positions.shape[0] < 2:
+            raise ValueError("target_positions must contain at least two positions.")
+
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("target_positions must contain only finite values.")
+
+        orientation = np.asarray(
+            target_orientation,
+            dtype=np.float64,
+        )
+
+        if orientation.shape != (3, 3) or not np.all(np.isfinite(orientation)):
+            raise ValueError("target_orientation must be a finite 3x3 rotation matrix.")
+
+        q_previous = np.asarray(
+            q_start,
+            dtype=np.float64,
+        ).copy()
+
+        if q_previous.shape != (arm.dof,):
+            raise ValueError(f"q_start must have shape ({arm.dof},).")
+
+        previous_frames = arm.forward_kinematics_chain(q_previous)
+        previous_tcp = previous_frames[-1][:3, 3].copy()
+
+        start_mismatch_mm = float(np.linalg.norm(previous_tcp - positions[0]))
+
+        if start_mismatch_mm > start_tolerance_mm:
+            return (
+                CollisionResult(
+                    collided=False,
+                    message=(
+                        "The first target position does not match the TCP "
+                        f"position of q_start by "
+                        f"{start_mismatch_mm:.3f} mm."
+                    ),
+                ),
+                None,
+            )
+
+        positions = positions.copy()
+        positions[0] = previous_tcp
+
+        for sample_index, target_position in enumerate(positions):
+            ik_success, q_sample, position_error = arm.inverse_kinematics(
+                target_pos=target_position,
+                target_rot=orientation,
+                q_init=q_previous,
+                max_iters=800,
+                pos_tol=0.2,
+                max_joint_jump_deg=max_joint_jump_deg,
+            )
+
+            if not ik_success:
+                return (
+                    CollisionResult(
+                        collided=True,
+                        message=(
+                            f"Cartesian trajectory sample {sample_index} is "
+                            f"unreachable; position error "
+                            f"{position_error:.3f} mm."
+                        ),
+                        sample_point_mm=target_position.copy(),
+                    ),
+                    None,
+                )
+
+            joint_jump = arm.joint_jump(
+                q_sample,
+                q_previous,
+            )
+
+            if joint_jump > max_joint_jump_deg:
+                return (
+                    CollisionResult(
+                        collided=True,
+                        message=(
+                            f"Cartesian trajectory sample {sample_index} creates "
+                            f"a joint-space discontinuity of "
+                            f"{joint_jump:.3f} degrees."
+                        ),
+                        sample_point_mm=target_position.copy(),
+                    ),
+                    None,
+                )
+
+            sample_frames = arm.forward_kinematics_chain(q_sample)
+
+            collision_result = self.check_chain_collision(
+                sample_frames,
+                allow_tool_contact=allow_tool_contact,
+                tool_contact_clearance_mm=tool_contact_clearance_mm,
+            )
+
+            if collision_result.collided:
+                return (
+                    CollisionResult(
+                        collided=True,
+                        message=(
+                            f"{collision_result.message} "
+                            f"(Cartesian trajectory sample {sample_index})"
+                        ),
+                        obstacle_name=collision_result.obstacle_name,
+                        link_name=collision_result.link_name,
+                        sample_point_mm=target_position.copy(),
+                    ),
+                    None,
+                )
+
+            q_previous = q_sample.copy()
+
+        return CollisionResult(collided=False, message="OK"), q_previous.copy()
+
     def get_workpiece_metadata(self) -> dict:
         """Returns scene metadata suitable for an MCP resource."""
         return {
@@ -679,8 +820,5 @@ class WorkpieceScene:
                 }
                 for obstacle in self.workpiece_obstacles
             ],
-            "seams": [
-                seam.model_dump()
-                for seam in self.seams.values()
-            ],
+            "seams": [seam.model_dump() for seam in self.seams.values()],
         }

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
-from mcp_robot_welding.kinematics import SixDofArm
+from mcp_robot_welding.kinematics import SixDofArm, create_manipulator
 from mcp_robot_welding.mcp_server import (
     export_robot_program,
     inspect_workpiece,
@@ -52,12 +53,7 @@ def test_inverse_kinematics_converges_to_fk_target() -> None:
     assert position_error < 0.1
 
     solved_pose = arm.forward_kinematics(solution)
-    assert (
-        np.linalg.norm(
-            solved_pose[:3, 3] - target_pose[:3, 3]
-        )
-        < 0.1
-    )
+    assert np.linalg.norm(solved_pose[:3, 3] - target_pose[:3, 3]) < 0.1
 
 
 def test_compile_gcode_program() -> None:
@@ -118,9 +114,9 @@ def test_full_mcp_welding_pipeline() -> None:
         robot_type="industrial_6dof",
     )
 
-    assert planning_result["status"] == "VALIDATED_OK", (
-        f"Unexpected planning response: {planning_result}"
-    )
+    assert (
+        planning_result["status"] == "VALIDATED_OK"
+    ), f"Unexpected planning response: {planning_result}"
     assert "plan_id" in planning_result
     assert planning_result["seams_planned"] == [
         "seam_top_rib",
@@ -128,8 +124,7 @@ def test_full_mcp_welding_pipeline() -> None:
     ]
 
     waypoint_labels = [
-        waypoint["label"]
-        for waypoint in planning_result["waypoints_summary"]
+        waypoint["label"] for waypoint in planning_result["waypoints_summary"]
     ]
 
     assert waypoint_labels[0] == "HOME_SAFE"
@@ -165,14 +160,14 @@ def test_full_mcp_welding_pipeline() -> None:
 
 
 def test_unknown_seam_is_rejected() -> None:
-    with pytest.raises(Exception, match="Unknown seam_id"):
+    with pytest.raises(ToolError, match="Unknown seam_id"):
         plan_and_simulate_weld(
             seam_ids=["non_existent_seam"],
         )
 
 
 def test_unknown_robot_type_is_rejected() -> None:
-    with pytest.raises(Exception, match="Unknown robot_type"):
+    with pytest.raises(ToolError, match="Unknown robot_type"):
         plan_and_simulate_weld(
             seam_ids=["seam_top_rib"],
             robot_type="delta_3dof",
@@ -190,10 +185,7 @@ def test_export_requires_plan_id() -> None:
 
 def test_multiple_robot_kinematic_profiles() -> None:
     robots_info = list_supported_robots()
-    robot_types = {
-        robot["robot_type"]
-        for robot in robots_info["supported_robots"]
-    }
+    robot_types = {robot["robot_type"] for robot in robots_info["supported_robots"]}
 
     assert robot_types == {
         "industrial_6dof",
@@ -207,9 +199,7 @@ def test_multiple_robot_kinematic_profiles() -> None:
         robot_type="cobot_6dof",
     )
 
-    assert cobot_plan["status"] == "VALIDATED_OK", (
-        f"Cobot failed: {cobot_plan}"
-    )
+    assert cobot_plan["status"] == "VALIDATED_OK", f"Cobot failed: {cobot_plan}"
     assert cobot_plan["dof"] == 6
 
     scara_plan = plan_and_simulate_weld(
@@ -218,9 +208,7 @@ def test_multiple_robot_kinematic_profiles() -> None:
         robot_type="scara_4dof",
     )
 
-    assert scara_plan["status"] == "VALIDATED_OK", (
-        f"SCARA failed: {scara_plan}"
-    )
+    assert scara_plan["status"] == "VALIDATED_OK", f"SCARA failed: {scara_plan}"
     assert scara_plan["dof"] == 4
 
     compiled_scara = export_robot_program(
@@ -232,3 +220,35 @@ def test_multiple_robot_kinematic_profiles() -> None:
     assert compiled_scara["status"] == "COMPILED"
     assert compiled_scara["robot_type"] == "scara_4dof"
     assert "; ROBOT MODEL: scara_4dof" in compiled_scara["program_code"]
+
+
+def test_tool_orientation_reachable_for_top_seam():
+    arm = create_manipulator("industrial_6dof")
+
+    seam_normal = np.array([0.0, 0.0, 1.0])
+    seam_tangent = np.array([1.0, 0.0, 0.0])
+    tool_z_direction = -seam_normal
+
+    target_rotation = arm.make_tool_orientation(
+        tool_z_direction,
+        reference_x_axis=seam_tangent,
+    )
+
+    target_position = np.array([480.0, 0.0, 180.0])
+
+    success, q, position_error = arm.inverse_kinematics(
+        target_pos=target_position,
+        target_rot=target_rotation,
+        pos_tol=0.1,
+        rot_tol=0.015,
+    )
+
+    assert success, f"IK failed: position_error={position_error}"
+
+    pose = arm.forward_kinematics(q)
+    orientation_error = arm._rotation_error(
+        pose[:3, :3],
+        target_rotation,
+    )
+
+    assert np.linalg.norm(orientation_error) < 0.015

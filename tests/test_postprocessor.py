@@ -13,6 +13,8 @@ def _make_waypoint(
     move_type: str = "MOVJ",
     arc_state: str | None = None,
     orientation: np.ndarray | None = None,
+    tcp_speed_mm_s: float | None = None,
+    joint_speed_percent: float | None = None,
 ) -> TrajectoryWaypoint:
     rot = np.eye(3) if orientation is None else orientation
     return TrajectoryWaypoint(
