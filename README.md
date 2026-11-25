@@ -1,6 +1,8 @@
 # MCP Robot Welding Simulator
 
-**MCP Robot Welding Simulator** — прототип MCP-сервиса для планирования, кинематической валидации и постпроцессинга программ дуговой сварки промышленными манипуляторами.
+[![CI](https://github.com/ajdanoff/mcp-robot-welding-sim/actions/workflows/ci.yml/badge.svg)](https://github.com/ajdanoff/mcp-robot-welding-sim/actions/workflows/ci.yml)
+
+**MCP Robot Welding Simulator** — прототип MCP-сервиса (MCP SDK v2) для генерации, кинематической валидации и постпроцессинга программ сварки промышленными манипуляторами.
 
 Сервис поддерживает:
 
