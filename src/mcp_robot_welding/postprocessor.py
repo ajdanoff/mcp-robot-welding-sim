@@ -33,9 +33,7 @@ class PostprocessorConfig:
 
     def __post_init__(self) -> None:
         if not 0.0 < self.override_percent <= 100.0:
-            raise ValueError(
-                "override_percent must be greater than 0 and at most 100."
-            )
+            raise ValueError("override_percent must be greater than 0 and at most 100.")
 
         if self.melfa_arc_start_delay_s < 0.0:
             raise ValueError("melfa_arc_start_delay_s must be non-negative.")
@@ -84,15 +82,13 @@ class TrajectoryWaypoint:
                 f"Unsupported arc state: '{self.arc_state}'. "
                 f"Supported states: {supported_states}."
             )
-        
+
         xyz = _finite_vector(self.xyz_mm, "xyz_mm", (3,))
         joints = _finite_vector(self.joints_deg, "joints_deg", None)
         orientation = _finite_rotation(self.orientation, "orientation")
 
         if joints.ndim != 1 or joints.size == 0:
-            raise ValueError(
-                "joints_deg must be a non-empty 1D array."
-            )
+            raise ValueError("joints_deg must be a non-empty 1D array.")
 
         if self.move_type == "MOVJ":
             if self.tcp_speed_mm_s is not None:
@@ -106,8 +102,7 @@ class TrajectoryWaypoint:
                 or not 0.0 < self.joint_speed_percent <= 100.0
             ):
                 raise ValueError(
-                    "MOVJ waypoints require joint_speed_percent between "
-                    "0 and 100."
+                    "MOVJ waypoints require joint_speed_percent between " "0 and 100."
                 )
 
         if self.move_type == "MOVL":
@@ -117,13 +112,8 @@ class TrajectoryWaypoint:
                     "not joint_speed_percent."
                 )
 
-            if (
-                self.tcp_speed_mm_s is None
-                or self.tcp_speed_mm_s <= 0.0
-            ):
-                raise ValueError(
-                    "MOVL waypoints require a positive tcp_speed_mm_s."
-                )
+            if self.tcp_speed_mm_s is None or self.tcp_speed_mm_s <= 0.0:
+                raise ValueError("MOVL waypoints require a positive tcp_speed_mm_s.")
 
         object.__setattr__(self, "xyz_mm", xyz)
         object.__setattr__(self, "joints_deg", joints)
@@ -159,9 +149,7 @@ def _finite_rotation(
     matrix = np.asarray(value, dtype=np.float64)
 
     if matrix.shape != (3, 3):
-        raise ValueError(
-            f"{name} must be a 3x3 rotation matrix; got {matrix.shape}."
-        )
+        raise ValueError(f"{name} must be a 3x3 rotation matrix; got {matrix.shape}.")
 
     if not np.all(np.isfinite(matrix)):
         raise ValueError(f"{name} must contain only finite values.")
@@ -241,8 +229,7 @@ def _rotation_to_melfa_abc_deg(
 
 def _joint_comment(waypoint: TrajectoryWaypoint) -> str:
     joints = " ".join(
-        f"J{index + 1}={value:.3f}"
-        for index, value in enumerate(waypoint.joints_deg)
+        f"J{index + 1}={value:.3f}" for index, value in enumerate(waypoint.joints_deg)
     )
     return f"; JOINTS {joints}"
 
@@ -284,19 +271,12 @@ def _compile_gcode(
             f"; {waypoint.label}"
         )
         lines.append(_joint_comment(waypoint))
-        lines.append(
-            f"; ORIENTATION_A_B_C_DEG "
-            f"{roll:.3f} {pitch:.3f} {yaw:.3f}"
-        )
+        lines.append(f"; ORIENTATION_A_B_C_DEG " f"{roll:.3f} {pitch:.3f} {yaw:.3f}")
 
         if waypoint.arc_state == "ARC_ON":
-            lines.append(
-                f"{config.gcode_arc_start_cmd} ; CONFIGURED ARC_START"
-            )
+            lines.append(f"{config.gcode_arc_start_cmd} ; CONFIGURED ARC_START")
         elif waypoint.arc_state == "ARC_OFF":
-            lines.append(
-                f"{config.gcode_arc_end_cmd} ; CONFIGURED ARC_END"
-            )
+            lines.append(f"{config.gcode_arc_end_cmd} ; CONFIGURED ARC_END")
 
     lines.append("M30 ; End of program")
     return "\n".join(lines)
@@ -347,29 +327,19 @@ def _compile_melfa(
 
             lines.append(f"Spd {waypoint.tcp_speed_mm_s:.3f}")
 
-        lines.append(
-            f"{melfa_move} P{waypoint_index} ' {waypoint.label}"
-        )
+        lines.append(f"{melfa_move} P{waypoint_index} ' {waypoint.label}")
 
         if waypoint.arc_state == "ARC_ON":
-            lines.append(
-                f"{config.melfa_arc_start_cmd} ' CONFIGURED ARC_START"
-            )
+            lines.append(f"{config.melfa_arc_start_cmd} ' CONFIGURED ARC_START")
 
             if config.melfa_arc_start_delay_s > 0.0:
-                lines.append(
-                    f"Dly {config.melfa_arc_start_delay_s:.3f}"
-                )
+                lines.append(f"Dly {config.melfa_arc_start_delay_s:.3f}")
 
         elif waypoint.arc_state == "ARC_OFF":
-            lines.append(
-                f"{config.melfa_arc_end_cmd} ' CONFIGURED ARC_END"
-            )
+            lines.append(f"{config.melfa_arc_end_cmd} ' CONFIGURED ARC_END")
 
             if config.melfa_arc_end_delay_s > 0.0:
-                lines.append(
-                    f"Dly {config.melfa_arc_end_delay_s:.3f}"
-                )
+                lines.append(f"Dly {config.melfa_arc_end_delay_s:.3f}")
 
     lines.append("")
     lines.append("Servo Off")

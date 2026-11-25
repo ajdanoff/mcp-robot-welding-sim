@@ -1,7 +1,7 @@
 [project]
 name = "mcp-robot-welding-sim"
 version = "0.1.0"
-description = "MCP Server & Kinematic Simulator for 6-DoF Industrial Welding Manipulator"
+description = "MCP Server & Kinematic Simulator for N-DoF Industrial Welding Manipulators"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "ruff>=0.9.0",
 ]
 
 [build-system]
@@ -21,3 +22,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
